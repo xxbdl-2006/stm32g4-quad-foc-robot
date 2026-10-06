@@ -1,0 +1,8 @@
+bool  enable
+float32 rate_hz                # 1..120
+float32 pulse_width_us         # 5..10000
+uint8 mode                     # 0=连续 1=单次 2=外部透传
+---
+bool  success
+float32 applied_rate_hz
+string message

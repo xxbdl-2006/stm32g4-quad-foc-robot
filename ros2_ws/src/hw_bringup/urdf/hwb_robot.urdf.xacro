@@ -1,0 +1,196 @@
+<?xml version="1.0"?>
+<!--
+  hwb_robot.urdf.xacro
+  四轮滑移转向底盘 + 相机 + 气泵的机器描述。
+
+  说明
+  ----
+  · 关节类型用的是 continuous（连续转动），因为四轮都是驱动轮、无限圈。
+  · 每个 joint 的 <command_interface> / <state_interface> 声明决定了
+    ros2_control 会导出什么接口；hw_ros2_control 的 on_init 会按这里
+    声明的接口做校验，缺 velocity 直接拒绝启动。
+  · <hardware> 段里的参数会被 HwbSystem::on_init 读走，见 hwb_system.cpp。
+  · 尺寸必须与实际机械一致；有偏差时优先改这里，里程计会自动跟随。
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="hwb_robot">
+
+  <xacro:arg name="can_interface" default="can0"/>
+  <xacro:arg name="use_ros2_control" default="false"/>
+
+  <!-- ================= 全局参数 ================= -->
+  <xacro:property name="wheel_radius"  value="0.065"/>
+  <xacro:property name="wheel_width"   value="0.032"/>
+  <xacro:property name="track_width"   value="0.42"/>
+  <xacro:property name="wheel_base"    value="0.30"/>
+  <xacro:property name="body_length"   value="0.46"/>
+  <xacro:property name="body_width"    value="0.40"/>
+  <xacro:property name="body_height"   value="0.14"/>
+  <xacro:property name="body_z"        value="0.09"/>
+  <xacro:property name="wheel_mass"    value="0.42"/>
+  <xacro:property name="body_mass"     value="9.8"/>
+
+  <!-- 惯性矩阵 -->
+  <xacro:macro name="box_inertia" params="m x y z">
+    <inertial>
+      <mass value="${m}"/>
+      <inertia ixx="${m*(y*y+z*z)/12.0}" ixy="0"
+               ixz="0" iyy="${m*(x*x+z*z)/12.0}"
+               iyz="0" izz="${m*(x*x+y*y)/12.0}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="cyl_inertia" params="m r h">
+    <inertial>
+      <mass value="${m}"/>
+      <inertia ixx="${m*(3.0*r*r+h*h)/12.0}" ixy="0" ixz="0"
+               iyy="${m*(3.0*r*r+h*h)/12.0}" iyz="0"
+               izz="${m*r*r/2.0}"/>
+    </inertial>
+  </xacro:macro>
+
+  <!-- ================= 材质 ================= -->
+  <material name="body_grey"><color rgba="0.35 0.37 0.40 1.0"/></material>
+  <material name="wheel_black"><color rgba="0.10 0.10 0.11 1.0"/></material>
+  <material name="cam_blue"><color rgba="0.20 0.45 0.85 1.0"/></material>
+  <material name="pump_amber"><color rgba="0.90 0.62 0.10 1.0"/></material>
+
+  <!-- ================= base_link ================= -->
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="${body_length} ${body_width} ${body_height}"/></geometry>
+      <material name="body_grey"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="${body_length} ${body_width} ${body_height}"/></geometry>
+    </collision>
+    <xacro:box_inertia m="${body_mass}" x="${body_length}" y="${body_width}" z="${body_height}"/>
+  </link>
+
+  <!-- ================= 四个驱动轮 =================
+       轮位命名与全程的索引约定一致：
+         0 = 左前 (front_left)   1 = 右前 (front_right)
+         2 = 左后 (rear_left)    3 = 右后 (rear_right)
+       这个顺序决定了 CAN 帧里的 IDX、MotorCommandArray 里的下标、
+       以及 motor_control 里 kinematics 的轮位数组。任何一处改了都必须全部改。
+  -->
+  <xacro:macro name="drive_wheel" params="idx name x_sign y_sign">
+    <link name="wheel_${idx}_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+        <geometry><cylinder radius="${wheel_radius}" length="${wheel_width}"/></geometry>
+        <material name="wheel_black"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="1.5707963 0 0"/>
+        <geometry><cylinder radius="${wheel_radius}" length="${wheel_width}"/></geometry>
+      </collision>
+      <xacro:cyl_inertia m="${wheel_mass}" r="${wheel_radius}" h="${wheel_width}"/>
+    </link>
+
+    <joint name="wheel_${idx}_joint" type="continuous">
+      <parent link="base_link"/>
+      <child  link="wheel_${idx}_link"/>
+      <origin xyz="${x_sign * wheel_base / 2.0} ${y_sign * track_width / 2.0} 0"
+              rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <dynamics damping="0.02" friction="0.05"/>
+      <!-- 电机实际能力：峰值 15A / 6A 额定，折算到轮上约 1.2 N·m 峰值。
+           这里给的是 ROS 侧限幅，比硬件保护宽松一档，让硬件先跳闸。 -->
+      <limit effort="1.5" velocity="60.0"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:drive_wheel idx="0" name="front_left"  x_sign=" 1" y_sign=" 1"/>
+  <xacro:drive_wheel idx="1" name="front_right" x_sign=" 1" y_sign="-1"/>
+  <xacro:drive_wheel idx="2" name="rear_left"   x_sign="-1" y_sign=" 1"/>
+  <xacro:drive_wheel idx="3" name="rear_right"  x_sign="-1" y_sign="-1"/>
+
+  <!-- ================= 相机 ================= -->
+  <link name="camera_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.030 0.060 0.060"/></geometry>
+      <material name="cam_blue"/>
+    </visual>
+    <xacro:box_inertia m="0.075" x="0.030" y="0.060" z="0.060"/>
+  </link>
+
+  <!-- 相机安装在车头前上方，向下俯视 20°，覆盖车体前方 0.35~3.0m -->
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="camera_link"/>
+    <origin xyz="${body_length/2.0 + 0.02} 0 ${body_height/2.0 - 0.01}"
+            rpy="0 0.34906585 0"/>
+  </joint>
+
+  <!-- 光学坐标系（REP-103：z 向前，x 向右，y 向下） -->
+  <link name="camera_optical_frame"/>
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child  link="camera_optical_frame"/>
+    <origin xyz="0 0 0" rpy="-1.5707963 0 -1.5707963"/>
+  </joint>
+
+  <!-- ================= 气泵（作为固定配重，不参与运动学） ================= -->
+  <link name="pump_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.11 0.07 0.07"/></geometry>
+      <material name="pump_amber"/>
+    </visual>
+    <xacro:box_inertia m="0.62" x="0.11" y="0.07" z="0.07"/>
+  </link>
+  <joint name="pump_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="pump_link"/>
+    <origin xyz="-${body_length/2.0 - 0.06} 0 0.02" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ================= IMU（预留，暂未装） ================= -->
+  <link name="imu_link"/>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="imu_link"/>
+    <origin xyz="0 0 ${body_height/2.0}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ================= ros2_control 硬件段 ================= -->
+  <xacro:if value="$(arg use_ros2_control)">
+    <ros2_control name="HwbSystem" type="system">
+      <hardware>
+        <plugin>hw_ros2_control/HwbSystem</plugin>
+        <param name="can_interface">$(arg can_interface)</param>
+        <param name="invert_direction">false</param>
+        <param name="send_enable_on_activate">true</param>
+        <param name="gear_ratio_joint_0">1.0</param>
+        <param name="gear_ratio_joint_1">1.0</param>
+        <param name="gear_ratio_joint_2">1.0</param>
+        <param name="gear_ratio_joint_3">1.0</param>
+        <param name="current_limit_joint_0">4.0</param>
+        <param name="current_limit_joint_1">4.0</param>
+        <param name="current_limit_joint_2">4.0</param>
+        <param name="current_limit_joint_3">4.0</param>
+      </hardware>
+
+      <xacro:macro name="wheel_ifaces" params="idx">
+        <joint name="wheel_${idx}_joint">
+          <command_interface name="velocity"/>
+          <command_interface name="position"/>
+          <command_interface name="effort"/>
+          <state_interface name="position"/>
+          <state_interface name="velocity"/>
+          <state_interface name="effort"/>
+          <state_interface name="temperature"/>
+        </joint>
+      </xacro:macro>
+
+      <xacro:wheel_ifaces idx="0"/>
+      <xacro:wheel_ifaces idx="1"/>
+      <xacro:wheel_ifaces idx="2"/>
+      <xacro:wheel_ifaces idx="3"/>
+    </ros2_control>
+  </xacro:if>
+
+</robot>

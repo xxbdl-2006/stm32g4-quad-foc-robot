@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>hw_ros2_control</name>
+  <version>2.4.1</version>
+  <description>
+    ros2_control 硬件接口插件，把 HWB-MC4G4 驱动板作为 System 接入
+    controller_manager。相比 motor_control 直接节点方式，这条路可以
+    复用官方的 joint_trajectory_controller / velocity_controllers。
+  </description>
+  <maintainer email="embedded@hwb.local">HWB Embedded</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>hardware_interface</depend>
+  <depend>pluginlib</depend>
+  <depend>hw_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

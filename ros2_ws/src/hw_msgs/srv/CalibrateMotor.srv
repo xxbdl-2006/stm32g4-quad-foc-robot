@@ -1,0 +1,8 @@
+# 触发电角度零点标定（250ms 流程，期间电机会被强制转到 A 相轴线）。
+# 调用前必须确保：电机已解锁、机械上允许自由转动、负载已脱开。
+uint8 motor_id
+bool  confirm_mechanical_free   # 上位机必须显式确认，防止误触发
+---
+bool  success
+float32 elec_offset            # rad，标定得到的电角度零点
+string message

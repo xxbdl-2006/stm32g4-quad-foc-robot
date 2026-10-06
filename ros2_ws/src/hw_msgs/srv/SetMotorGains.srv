@@ -1,0 +1,15 @@
+# 在线整定 PID。写的是 RAM，掉电丢失；要持久化请另调 SaveParams。
+uint8 motor_id
+uint8 LOOP_CURRENT  = 0
+uint8 LOOP_VELOCITY = 1
+uint8 LOOP_POSITION = 2
+uint8 loop
+float32 kp
+float32 ki
+float32 kd
+---
+bool  success
+float32 kp_readback
+float32 ki_readback
+float32 kd_readback
+string message

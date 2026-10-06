@@ -1,0 +1,16 @@
+# 用一个"世界坐标已知"的标定点校正像素→地面的投影链路。
+#
+# 与 demo 的区别：demo 用 robot_x = a*obj_y + b 这种一次性线性拟合，
+# 系数写死在脚本里；本项目把相机内参、安装外参、车体位姿都算进投影链路，
+# 因此只需要极少量标定点来校正残差（通常是装配公差和镜头畸变）。
+# 标定结果只修正一个 2D 仿射残差，不动主链路。
+uint8  block_color             # 标定块的颜色（便于视觉侧定位它）
+float32 pixel_x
+float32 pixel_y
+float64 world_x                # odom 系下的真实地面坐标
+float64 world_y
+---
+bool  success
+float32 residual_before_m      # 校正前的重投影误差
+float32 residual_after_m       # 校正后
+string message

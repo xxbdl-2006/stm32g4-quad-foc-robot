@@ -1,0 +1,168 @@
+# ============================================================================
+#  task.yaml —— 取放任务参数
+#
+#  这份文件里的每个数字都能追溯到某个物理量或某次实测。改之前先看注释。
+#  与睿抗比赛 demo 的对应关系写在 docs/06_task_control.md 里。
+# ============================================================================
+
+/**:
+  ros__parameters:
+    use_sim_time: false
+
+# ---------------------------------------------------------------------------
+# 状态机与任务执行
+# ---------------------------------------------------------------------------
+task_executor:
+  ros__parameters:
+    # 50 Hz。再高没有必要（底盘速度环是 100 Hz，视觉是 30 Hz），
+    # 再低会让 SETTLE/RELEASE 这类短状态的时间分辨率变差。
+    control_rate_hz: 50.0
+
+    odom_frame: "odom"
+    camera_frame: "camera_optical_frame"
+    publish_targets: true
+
+    # ---- 相机内参 ----
+    # 用 ros2 run camera_calibration cameracalibrator 标出来填这里。
+    # 下面这组是 640x480 下 4mm 焦距、1/4" 传感器的典型值，**必须重新标定**。
+    # 内参错 5%，在 0.6m 距离上就是 30mm 的定位误差 —— 直接抓空。
+    camera:
+      fx: 600.0
+      fy: 600.0
+      cx: 320.0
+      cy: 240.0
+      width: 640
+      height: 480
+      k1: 0.0
+      k2: 0.0
+
+    # ---- 视觉判据 ----
+    # min/max_area_px 直接沿用 demo 的 2000 / 30000：
+    # 那个范围是在同样的物块尺寸和相机高度下试出来的，实测仍然合适。
+    vision:
+      min_area_px: 2000.0
+      max_area_px: 30000.0
+      min_confidence: 0.55
+      # 连续 3 帧才算稳定。demo 用的是"同角度出现两次"，
+      # 这里改成地面坐标下的连续帧计数，理由是相机在动（见 block_tracker.hpp）。
+      min_stable_frames: 3
+
+    # ---- 数据关联 ----
+    tracker:
+      # 车最快 0.85 m/s、控制周期 20ms 时位移 17mm；加上投影噪声与里程计漂移，
+      # 60mm 有足够余量，又小于物块尺寸（80mm）不会串到隔壁物块。
+      match_radius: 0.060
+      max_missing_frames: 5
+      track_ttl: 20.0
+
+    # ---- 可抓范围（底盘正前方扇形）----
+    grasp:
+      radius_min: 0.18      # 再近吸盘对不准（相机离物块太近会出视野）
+      radius_max: 0.85      # 再远斜俯视的投影误差迅速变大
+      bearing_max: 0.60     # rad ≈ 34°
+
+    # ---- 运动 ----
+    motion:
+      approach_speed: 0.35  # m/s，粗定位
+      align_speed: 0.09     # m/s，精定位。必须慢 —— 滑移转向没有横向自由度，
+                            # 只能靠转向修正，速度快了一定过冲然后在目标附近画圈。
+      scan_yaw_rate: 0.45   # rad/s，扫描时原地转
+      standoff: 0.34        # m，停位时物块到车体中心的距离 = 吸盘安装位置
+      standoff_tol: 0.030   # m
+      bearing_tol: 0.045    # rad ≈ 2.6°
+      yaw_kp: 1.8
+      lateral_kp: 1.6
+      longitudinal_kp: 1.2
+      speed_min: 0.02
+
+    # ---- 超时 ----
+    timeout:
+      scan: 12.0            # 转一圈 ≈ 14s（0.45 rad/s），留一点余量
+      approach: 15.0
+      align: 8.0
+      settle: 0.35          # 停稳等待：轮胎侧偏恢复 + 悬架回弹约需 0.2~0.3s
+      descend: 0.30         # 抽真空时间
+      grasp: 1.5            # 等压力达标
+      lift: 0.40
+      haul: 45.0
+      place: 15.0
+      release: 0.50
+      retreat: 1.20
+      vision_lost: 0.60     # 丢视觉超过此时长就退回扫描
+
+    # ---- 重试 ----
+    retry:
+      scan: 3
+      align: 2
+      grasp: 2              # 吸不住时重新对位再试的次数
+
+    # ---- 气泵（真空吸盘）----
+    # demo 里是 vgripper.on() / .off() 两个动作；这里升级成：
+    #   · use_pressure_mode: true 让驱动板的压力环维持真空（硬件已实现）
+    #     好处是漏气时驱动板自动加大功率，上位机只需看压力是否达标
+    #   · use_pressure_check: true 用压力判定"真吸住了"，
+    #     而不是 demo 的"定时到了就算吸住"——后者会漏判压在物块边缘吸空的情况
+    pump:
+      grasp_duty: 1.0
+      hold_duty: 0.75       # 搬运途中降占空比：【为什么】24V/5A 的泵满功率
+                            # 连续工作 3 分钟就会让 MOS 到 110°C，
+                            # 维持真空只需要 ~75%
+      use_pressure_check: true
+      use_pressure_mode: true
+      vacuum_target_kpa: -25.0    # 压力环目标（表压，真空为负）
+      vacuum_threshold_kpa: 6.0   # 压力绝对值超过此值判为吸住
+
+    # ---- 投放阵列 ----
+    # 【与 demo 的差异】demo 是 SCARA 机械臂，在同一个 XY 上按 0.055m 一层
+    # 往上码垛。本车是地面移动平台，没有 Z 轴，无法叠高，因此改成一排。
+    # 间距 0.12m = 物块 80mm + 30mm 取放余量。
+    place:
+      x: 0.00               # odom 系投放阵列起点
+      y: 1.20
+      yaw: 1.5707963        # 放置时车体朝向（+y 方向）
+      pitch: 0.12
+      columns: 4            # 每行 4 个，超出自动换行
+      row_pitch: 0.12
+
+    # ---- 起点 ----
+    home:
+      x: 0.00
+      y: 0.00
+      yaw: 0.0
+
+# ---------------------------------------------------------------------------
+# 物块识别
+# ---------------------------------------------------------------------------
+block_detector:
+  ros__parameters:
+    image_topic: "/image_raw"
+
+    # 【为什么默认不镜像】demo 里的 cv2.flip(frame, 1) 是因为它用的是一个
+    # 摆在桌上、镜头朝向操作者的 USB 摄像头，镜像后操作手感才对。
+    # 本项目相机固装在车头朝前，镜像会把像素 x 轴翻过来，
+    # 而投影链路按标准 OpenCV 约定（x 向右）写的 —— 镜像之后左右会反，
+    # 抓取点会偏到物块的镜像位置。只在换成后视相机时才需要打开。
+    flip_horizontal: false
+
+    # ROI：只在这个矩形里做检测，坐标会自动加回全图偏移。
+    # demo 用的 x0=145, x1=460, y0=160, y1=380（62500 像素宽高比下）。
+    # 这里是 640x480 的相机，ROI 取下半部分（物块只会出现在地面那一段）。
+    # 全 0 表示不裁剪。
+    roi:
+      x0: 120
+      x1: 520
+      y0: 200
+      y1: 440
+
+    min_area_px: 2000.0
+    max_area_px: 30000.0
+    morph_kernel: 5
+    use_sharpen: true
+
+    # 像素域的预筛（真正的地面坐标稳定判据在 task_executor 里）。
+    # 两个数都是"减负"用的：把明显抖动的东西先挡掉，不参与后续投影。
+    prefilter_stable_frames: 2
+    prefilter_radius_px: 40.0
+
+    max_blocks_per_frame: 8
+    debug_view: false        # true 会弹出 OpenCV 窗口显示检测结果

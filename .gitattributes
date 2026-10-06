@@ -1,0 +1,43 @@
+# ============================================================================
+#  行尾统一成 LF
+#
+#  这个工程在 Windows 上开发、在 Ubuntu 上编译运行。如果让 Git 按 Windows 的
+#  习惯把文本存成 CRLF，会踩两个坑：
+#    · scripts/*.sh 到 Linux 上第一行就报 "bad interpreter: /bin/bash^M"
+#    · udev 规则 / systemd unit 之类带行尾敏感语法的文件会静默失效
+#  所以仓库里一律存 LF，检出也一律 LF（eol=lf），别依赖 core.autocrlf。
+# ============================================================================
+* text=auto eol=lf
+
+# 明确指定（防止 auto 判断失误）
+*.sh      text eol=lf
+*.py      text eol=lf
+*.c        text eol=lf
+*.h        text eol=lf
+*.cpp      text eol=lf
+*.hpp      text eol=lf
+*.msg      text eol=lf
+*.srv      text eol=lf
+*.yaml     text eol=lf
+*.yml      text eol=lf
+*.xml      text eol=lf
+*.xacro    text eol=lf
+*.urdf     text eol=lf
+*.md       text eol=lf
+*.rules    text eol=lf
+*.rviz     text eol=lf
+*.cmake    text eol=lf
+CMakeLists.txt text eol=lf
+
+# Windows 专用脚本才用 CRLF
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+
+# 二进制
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.pdf     binary
+*.ico     binary
+*.woff*   binary

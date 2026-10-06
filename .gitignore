@@ -1,0 +1,41 @@
+# ---- 构建产物 ----
+firmware/build/
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+*.lst
+
+# ---- 工具链缓存 / 编辑器 ----
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ---- 运行时产物 ----
+*.bag
+*.db3
+*.csv
+/tmp/
+
+# ---- 本机的工程笔记（含内部讨论记录，不进公开仓库）----
+.workbuddy/
+
+# ---- 系统垃圾 ----
+.DS_Store
+Thumbs.db
+*.swp
+*~

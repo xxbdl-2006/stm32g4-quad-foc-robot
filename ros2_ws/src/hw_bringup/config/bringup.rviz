@@ -1,0 +1,144 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /TF1
+        - /Odometry1
+      Splitter Ratio: 0.55
+    Tree Height: 640
+  - Class: rviz_common/Views
+    Name: Views
+    Expanded:
+      - /Current View1
+    Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    # ---- 全局网格 ----
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Alpha: 0.4
+      Cell Size: 0.5
+      Color: 160; 160; 164
+      Line Style:
+        Line Width: 0.02
+        Value: Lines
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 20
+
+    # ---- 机器人模型（来自 /robot_description）----
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Enabled: true
+      Description Source: Topic
+      Description Topic:
+        Value: /robot_description
+      Visual Enabled: true
+      Collision Enabled: false
+      Alpha: 1
+      Links:
+        All Links Enabled: true
+        Expand Joint Details: false
+        Expand Link Details: false
+      Update Interval: 0
+
+    # ---- TF 树：先看这个，它是 90% 位姿问题的答案 ----
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Names: true
+      Show Arrows: false
+      Show Axes: true
+      Marker Scale: 0.35
+      Update Interval: 0
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+
+    # ---- 里程计轨迹 ----
+    - Class: rviz_default_plugins/Odometry
+      Name: Odometry
+      Enabled: true
+      Topic:
+        Value: /odom
+        Depth: 20
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Keep: 300
+      Position Tolerance: 0.05
+      Angle Tolerance: 0.05
+      Covariance:
+        Position:
+          Value: true
+        Orientation:
+          Value: true
+        Scale: 1
+      Shape:
+        Value: Arrow
+        Color: 30; 144; 255
+        Alpha: 0.7
+        Shaft Length: 0.15
+        Shaft Radius: 0.02
+        Head Length: 0.06
+        Head Radius: 0.04
+
+    # ---- 相机位姿：把 /camera/sync_joint_states 的关节角画成 4 个小箭头。
+    #      注意这是**关节角**的可视化，不是笛卡尔位姿（见 CameraSync.msg 注释）。
+    - Class: rviz_default_plugins/PoseArray
+      Name: CameraSyncPose
+      Enabled: true
+      Topic:
+        Value: /camera/sync_pose
+        Depth: 20
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Shape:
+        Value: Arrow
+        Color: 46; 204; 113
+        Alpha: 0.9
+        Shaft Length: 0.1
+        Shaft Radius: 0.01
+        Head Length: 0.03
+        Head Radius: 0.02
+
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: odom
+    Frame Rate: 30
+
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 1.6
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0.1
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Near Clip Distance: 0.01
+      Pitch: 0.45
+      Target Frame: base_link
+      Yaw: 0.8
+
+Window Geometry:
+  Height: 900
+  Width: 1500
+  Displays:
+    collapsed: false
+  Views:
+    collapsed: false

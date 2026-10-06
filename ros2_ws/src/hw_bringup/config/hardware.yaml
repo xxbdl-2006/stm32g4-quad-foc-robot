@@ -1,0 +1,87 @@
+# ============================================================================
+#  硬件参数总表
+#
+#  这份文件里的每一个值都在驱动板固件里有对应的默认值
+#  （见 firmware/Core/Src/param.c 的 param_load_defaults）。
+#  两边不一致时以**固件**为准运行，本文件只决定上位机侧的解读方式。
+#  真正的持久化参数（PID、编码器零点）必须通过 /hw/save_params 写入驱动板
+#  Flash，改这里的数字不会有任何效果 —— 这是一开始就定死的边界，
+#  避免出现"改 yaml 看起来生效了但一上电又变回去"的幽灵问题。
+# ============================================================================
+
+/**:
+  ros__parameters:
+    use_sim_time: false
+
+# ---------------------------------------------------------------------------
+#  CAN 桥节点：负责驱动板 <-> ROS2 的话题/服务翻译
+# ---------------------------------------------------------------------------
+can_bridge:
+  ros__parameters:
+    can_interface: "can0"
+    # 反馈汇总频率。驱动板以 200Hz/电机上报，这里 100Hz 聚合发一帧，
+    # 下游控制器足够用，同时把话题流量控制在对 CPU 友好的水平。
+    flush_period_ms: 10
+    # 超过这个时间没收到心跳就认为驱动板掉线
+    heartbeat_timeout_ms: 500
+    # 是否把原始 CAN 帧也转发到 /hw/can_raw（调试时才开，会显著增加负载）
+    publish_raw: false
+    # 速度模式指令是否自动带 enable 位。上层只发 setpoint 时更方便；
+    # 如果上层自己管理使能（例如用 ros2_control），应设为 false。
+    auto_enable_on_cmd: true
+    # 用 ros2_control 时置 false，防止两套控制律同时下发运动指令
+    motion_output_enabled: true
+
+# ---------------------------------------------------------------------------
+# 底盘控制器
+# ---------------------------------------------------------------------------
+motor_control:
+  ros__parameters:
+    drive_type: "skid_steer"        # skid_steer | mecanum | four_steer
+
+    # 机械参数（与 URDF 必须一致，否则里程计会系统性偏差）
+    wheel_radius: 0.065             # m
+    track_width: 0.42               # m，左右轮中心距
+    wheel_base: 0.30                # m，前后轴距
+    gear_ratio: 1.0                 # 本车电机直驱
+
+    max_linear_velocity: 1.20       # m/s
+    max_angular_velocity: 4.00      # rad/s
+    linear_accel_limit: 1.50        # m/s^2，指令斜坡
+    angular_accel_limit: 3.00       # rad/s^2
+    command_rate_hz: 100.0          # 指令下发频率（必须 < 驱动板看门狗频率）
+
+    # 每轮电流预算（A）。四轮合计会接近 16A，24V 下就是 384W，
+    # 已核对电源选型（明纬 LRS-450-24，450W 余量 17%）。
+    current_budget_per_wheel: 4.0
+
+    odom_frame: "odom"
+    base_frame: "base_link"
+    publish_tf: true
+
+    # 电机安装方向修正：只要物理上某个轮的转向与解算符号相反就翻这里。
+    # 标定方法见 docs/05_tuning.md 第 4 节。
+    invert_motor_direction: [1, 1, 1, 1]
+
+# ---------------------------------------------------------------------------
+# 相机触发/同步
+# ---------------------------------------------------------------------------
+camera_trigger:
+  ros__parameters:
+    rate_hz: 30.0
+    pulse_width_us: 100.0           # 相机 datasheet 要求 > 10us，留 10 倍余量
+    auto_start: true
+    image_topic: "/image_raw"
+    match_window_s: 0.040           # 图像与同步事件的配对时间窗
+    initial_exposure_delay_s: 0.0012
+    joint_names: ["wheel_0_joint", "wheel_1_joint", "wheel_2_joint", "wheel_3_joint"]
+
+# ---------------------------------------------------------------------------
+# 气泵（通过 /hw/set_pump 服务使用；这里只是启动时的初始状态）
+# ---------------------------------------------------------------------------
+pump_bringup:
+  ros__parameters:
+    initial_cmd: 0                  # 0=停
+    initial_mode: 0                 # 0=开环占空比
+    initial_duty: 0.0
+    initial_target_pressure: 40.0   # kPa

@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>hw_task</name>
+  <version>1.0.0</version>
+  <description>
+    视觉引导取放任务层。参照睿抗（RAICOM）比赛 demo 的取放流程实现，
+    针对"相机装在移动底盘上"这个前提重做了三处关键设计：
+      · 像素 -> 地面坐标走完整投影链路（相机内外参 + 实时位姿），
+        而不是 demo 里那两行一次性线性标定 —— 车一动线性标定就失效；
+      · 多帧稳定判据放在地面坐标系里做数据关联，而不是按图像角度匹配；
+      · 用气泵压力反馈判定"真吸住了"，而不是"定时到了就算吸住"。
+    核心状态机不依赖 rclcpp，可在无 ROS 的开发机上单独跑回归测试。
+  </description>
+  <maintainer email="embedded@hwb.local">HWB Embedded</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>hw_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>eigen</depend>
+  <depend>cv_bridge</depend>
+
+  <exec_depend>opencv</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

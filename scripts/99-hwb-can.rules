@@ -1,0 +1,31 @@
+# ============================================================================
+#  99-hwb-can.rules —— 让 CAN 接口开机自动按本项目参数拉起来，且普通用户可用
+#
+#  安装：
+#     sudo cp scripts/99-hwb-can.rules /etc/udev/rules.d/
+#     sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+#  装好之后：
+#     · USB-CAN 插入即自动 ip link set can0 type can bitrate 1000000 && up
+#     · 设备节点组为 plugdev，当前用户无需 sudo 即可收发
+#     · launch 文件里的 auto_setup_can 会因为"已经是 UP"而自动跳过，
+#       不会再弹出 sudo 提示
+# ============================================================================
+
+# ---- CANable / cantact / 各类 gs_usb 适配器 ----
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", \
+    NAME="can0", RUN+="/sbin/ip link set can0 type can bitrate 1000000 sample-point 0.800 restart-ms 100", \
+    RUN+="/sbin/ip link set can0 up"
+
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="606f", \
+    NAME="can0", RUN+="/sbin/ip link set can0 type can bitrate 1000000 sample-point 0.800 restart-ms 100", \
+    RUN+="/sbin/ip link set can0 up"
+
+# ---- 若用 PEAK PCAN-USB ----
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="0c72", \
+    NAME="can0", RUN+="/sbin/ip link set can0 type can bitrate 1000000 sample-point 0.800 restart-ms 100", \
+    RUN+="/sbin/ip link set can0 up"
+
+# ---- 普通用户访问权限 ----
+SUBSYSTEM=="net", KERNEL=="can*", ACTION=="add", \
+    RUN+="/bin/chgrp plugdev /sys/class/net/%k", MODE="0660"

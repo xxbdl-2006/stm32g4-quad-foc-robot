@@ -1,0 +1,104 @@
+# ============================================================================
+#  controllers.yaml —— ros2_control 路径的控制器配置
+#
+#  注意这里**没有**给关节配 position/effort 指令接口的控制器：
+#  驱动板的 position 模式是"给定目标角 -> 板内位置环",精度取决于编码器分辨率
+#  （14bit 单圈，折算到输出轴约 0.022°），够用但不如把轨迹交给
+#  joint_trajectory_controller 做前瞻插补。下面两种都用，按需启用。
+# ============================================================================
+controller_manager:
+  ros__parameters:
+    update_rate: 100          # Hz，与 /hw/motor_states 的 100Hz 聚合频率对齐
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    diff_drive_controller:
+      type: diff_drive_controller/DiffDriveController
+
+    wheel_velocity_controller:
+      type: velocity_controllers/JointGroupVelocityController
+
+    arm_joint_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+# ---------------------------------------------------------------------------
+# 差速轮式控制器（滑移转向的近似）
+# ---------------------------------------------------------------------------
+diff_drive_controller:
+  ros__parameters:
+    left_wheel_names:  ["wheel_0_joint", "wheel_2_joint"]
+    right_wheel_names: ["wheel_1_joint", "wheel_3_joint"]
+
+    wheel_separation: 0.42          # m，必须与 motor_control 的 track_width 一致
+    wheel_radius: 0.065             # m
+
+    # 实际轮距比几何轮距大 —— 滑移转向时外侧轮会拖，等效轮距通常比
+    # 实测值大 10%~25%。这个系数是用"直线走 5m 看偏航漂移"的办法标出来的
+    # （docs/05_tuning.md 第 5 节），本项目实测值 1.18。
+    wheel_separation_multiplier: 1.18
+    wheel_radius_multiplier: 1.00
+
+    publish_rate: 50.0
+    odom_frame_id: odom
+    base_frame_id: base_link
+    pose_covariance_diagonal: [0.001, 0.001, 0.0, 0.0, 0.0, 0.01]
+    twist_covariance_diagonal: [0.001, 0.001, 0.0, 0.0, 0.0, 0.01]
+    open_loop: false                # 用轮速反馈算里程计，不用指令推算
+
+    enable_odom_tf: true
+    cmd_vel_timeout: 0.5            # s，超过就发零速（与驱动板看门狗 300ms 呼应）
+    use_stamped_vel: false
+
+    # 限速：与 motor_control 的参数保持一致
+    linear:
+      x:
+        has_velocity_limits: true
+        max_velocity: 1.20
+        has_acceleration_limits: true
+        max_acceleration: 1.50
+    angular:
+      z:
+        has_velocity_limits: true
+        max_velocity: 4.00
+        has_acceleration_limits: true
+        max_acceleration: 3.00
+
+# ---------------------------------------------------------------------------
+# 四轮速度组控制器（调试单个轮子时用它，比 diff_drive 直观）
+# ---------------------------------------------------------------------------
+wheel_velocity_controller:
+  ros__parameters:
+    joints:
+      - wheel_0_joint
+      - wheel_1_joint
+      - wheel_2_joint
+      - wheel_3_joint
+    interface_name: velocity
+    command_interfaces:
+      - velocity
+    state_interfaces:
+      - position
+      - velocity
+
+# ---------------------------------------------------------------------------
+# 关节轨迹控制器：需要做精确多轴同步运动（例如"四轮同时转到指定角度"）时启用
+# ---------------------------------------------------------------------------
+arm_joint_trajectory_controller:
+  ros__parameters:
+    joints:
+      - wheel_0_joint
+      - wheel_1_joint
+      - wheel_2_joint
+      - wheel_3_joint
+    command_interfaces:
+      - velocity
+    state_interfaces:
+      - position
+      - velocity
+    allow_partial_joints_goal: false
+    constraints:
+      stopped_velocity_tolerance: 0.05
+      goal_time: 0.5
+    state_publish_rate: 50.0
+    action_monitor_rate: 20.0

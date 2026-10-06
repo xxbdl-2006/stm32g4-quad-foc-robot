@@ -1,0 +1,5 @@
+# 把当前 RAM 里的参数写入驱动板 Flash（阻塞约 20ms，期间控制环正常运行）。
+uint8 motor_id                 # 0xFF 表示保存全部
+---
+bool  success
+string message

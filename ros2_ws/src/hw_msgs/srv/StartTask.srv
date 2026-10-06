@@ -1,0 +1,12 @@
+# 启动取放任务。
+#
+# 对应 demo 里 "arm.enable() -> 进入抓取循环" 那一步，但做了工程化：
+# demo 是一次性脚本，这里是可以随时启停、可指定颜色顺序的任务。
+uint32 max_blocks              # 最多抓几个，0 表示抓到没有再停
+uint8[] color_order            # 期望的颜色抓取顺序；空数组 = 按发现顺序
+bool   require_stable          # 是否要求物块连续多帧稳定后才抓（比赛正式轮建议 true）
+bool   return_home_after       # 全部完成后是否回到起始位置
+---
+bool success
+string message
+uint32 planned_targets

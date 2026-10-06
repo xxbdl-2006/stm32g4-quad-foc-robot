@@ -1,0 +1,13 @@
+<library path="hw_ros2_control">
+  <class
+    name="hw_ros2_control/HwbSystem"
+    type="hw_ros2_control::HwbSystem"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>
+      HWB-MC4G4 四轴 FOC 驱动板的 ros2_control 硬件接口。
+      通过 Linux SocketCAN (can0) 使用自定义精简协议与驱动板通信，
+      导出 position / velocity / effort / temperature 状态接口
+      与 position / velocity / effort 命令接口。
+    </description>
+  </class>
+</library>

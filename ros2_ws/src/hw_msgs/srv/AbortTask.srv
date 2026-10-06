@@ -1,0 +1,7 @@
+# 中止任务。行为取决于当前是否搬着东西。
+bool release_payload           # true = 就地放下（停泵）；false = 保持吸住并原地停
+bool return_home               # 中止后是否回起始位置
+---
+bool success
+string message
+uint8 last_state

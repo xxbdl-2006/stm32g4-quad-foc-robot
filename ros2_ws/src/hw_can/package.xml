@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>hw_can</name>
+  <version>2.4.1</version>
+  <description>
+    HWB-MC4G4 驱动板的 CAN 桥接节点。
+    直接使用 Linux SocketCAN（can0），把自定义精简协议翻译成 ROS2 话题与服务。
+    不依赖任何第三方 CAN 中间件。
+  </description>
+  <maintainer email="embedded@hwb.local">HWB Embedded</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>hw_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

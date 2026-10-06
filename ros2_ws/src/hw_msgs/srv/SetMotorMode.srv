@@ -1,0 +1,8 @@
+# 切换单台电机的工作模式。会触发板卡清积分器并做平滑过渡。
+uint8 motor_id
+uint8 mode                     # 与 MotorCommand 的 MODE_* 一致
+bool  enable
+---
+bool  success
+uint8 active_mode
+string message

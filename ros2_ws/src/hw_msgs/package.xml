@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>hw_msgs</name>
+  <version>2.4.1</version>
+  <description>
+    HWB-MC4G4 四轴 FOC 驱动板的 ROS2 消息与服务定义。
+    消息字段与固件 Core/Inc/can_proto.h 中的结构体逐位对应，
+    修改任一侧都必须同步另一侧并递增 PARAM_VERSION。
+  </description>
+  <maintainer email="embedded@hwb.local">HWB Embedded</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>rosidl_default_generators</build_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

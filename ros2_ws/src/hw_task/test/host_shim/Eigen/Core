@@ -1,0 +1,202 @@
+// ============================================================================
+//  Eigen 最小垫片 —— 仅供 hw_task 的主机侧逻辑测试使用
+//
+//  为什么会有这个文件
+//  ------------------
+//  hw_task 的三个核心文件（ground_projection / block_tracker / task_sequencer）
+//  刻意不依赖 rclcpp，就是为了能在没有 ROS 的机器上单独跑状态机验证。
+//  但它们用了 Eigen 的向量/矩阵（目标机上由 Eigen3 提供）。
+//  这个垫片只实现实际用到的那几个操作，让测试在没有 Eigen 的开发机上也能跑。
+//
+//  它不是 Eigen 的替代品：没有表达式模板、没有 SIMD、没有动态尺寸矩阵。
+//  目标机上请用真正的 Eigen3（CMake 里用 HW_TASK_USE_SYSTEM_EIGEN 开关）。
+//
+//  数学正确性由 test_sequencer.cpp 保证 —— 垫片里的向量运算一旦写错，
+//  "把像素投到地面应该落在已知位置"这条断言会立刻失败。
+// ============================================================================
+#ifndef HOST_SHIM_EIGEN_CORE
+#define HOST_SHIM_EIGEN_CORE
+
+#include <array>
+#include <cstddef>
+#include <cmath>
+
+namespace Eigen
+{
+
+class Matrix3d;
+class Matrix4d;
+
+// ---------------------------------------------------------------------------
+//  定长向量
+// ---------------------------------------------------------------------------
+template<int N>
+class Vector
+{
+public:
+  Vector() { d_.fill(0.0); }
+
+  template<typename... Args>
+  Vector(double a, double b, Args... rest)
+  {
+    static_assert(sizeof...(rest) + 2 == static_cast<std::size_t>(N), "维度不匹配");
+    const double vals[] = {a, b, static_cast<double>(rest)...};
+    for (int i = 0; i < N; ++i) { d_[static_cast<std::size_t>(i)] = vals[i]; }
+  }
+
+  double & operator()(int i) { return d_[static_cast<std::size_t>(i)]; }
+  double operator()(int i) const { return d_[static_cast<std::size_t>(i)]; }
+
+  double x() const { return d_[0]; }
+  double y() const { return d_[1]; }
+  double & x() { return d_[0]; }
+  double & y() { return d_[1]; }
+  double z() const { return d_[2]; }
+
+  double norm() const { return std::sqrt(squaredNorm()); }
+
+  double squaredNorm() const
+  {
+    double s = 0.0;
+    for (int i = 0; i < N; ++i) {
+      s += d_[static_cast<std::size_t>(i)] * d_[static_cast<std::size_t>(i)];
+    }
+    return s;
+  }
+
+  Vector normalized() const
+  {
+    const double n = norm();
+    Vector out = *this;
+    if (n > 1e-15) { out /= n; }
+    return out;
+  }
+
+  Vector & operator+=(const Vector & o)
+  {
+    for (int i = 0; i < N; ++i) { d_[static_cast<std::size_t>(i)] += o(i); }
+    return *this;
+  }
+  Vector & operator-=(const Vector & o) { return *this += (o * -1.0); }
+  Vector & operator*=(double s)
+  {
+    for (int i = 0; i < N; ++i) { d_[static_cast<std::size_t>(i)] *= s; }
+    return *this;
+  }
+  Vector & operator/=(double s) { return *this *= (1.0 / s); }
+
+  friend Vector operator+(Vector a, const Vector & b) { return a += b; }
+  friend Vector operator-(Vector a, const Vector & b) { return a -= b; }
+  friend Vector operator*(Vector a, double s) { return a *= s; }
+  friend Vector operator*(double s, Vector a) { return a *= s; }
+  friend Vector operator/(Vector a, double s) { return a /= s; }
+
+private:
+  std::array<double, N> d_{};
+};
+
+using Vector2d = Vector<2>;
+using Vector3d = Vector<3>;
+
+// ---------------------------------------------------------------------------
+//  逗号初始化器
+//
+//  C++ 里逗号优先级低于 <<，所以 `m << a, b, c` 解析成 `((m << a), b), c`。
+//  Eigen 靠 `<<` 返回一个重载了 operator, 的中间对象来接住后面的值。
+// 自造垫片最容易在这里写错（写成 `Matrix3d& operator<<(double)` 的话，
+// 只有第一个值会被存下来，其余全被丢掉 —— 而且编译器不会报错）。
+// ---------------------------------------------------------------------------
+class CommaInit3
+{
+public:
+  CommaInit3(Matrix3d * m, int idx) : m_(m), idx_(idx) {}
+  CommaInit3 & operator,(double v);
+
+private:
+  Matrix3d * m_;
+  int idx_;
+};
+
+// ---------------------------------------------------------------------------
+class Matrix3d
+{
+public:
+  Matrix3d() { d_.fill(0.0); }
+  Matrix3d(const Matrix3d &) = default;
+  Matrix3d & operator=(const Matrix3d &) = default;
+
+  static Matrix3d Identity()
+  {
+    Matrix3d m;
+    m(0, 0) = m(1, 1) = m(2, 2) = 1.0;
+    return m;
+  }
+
+  double & operator()(int r, int c) { return d_[static_cast<std::size_t>(r * 3 + c)]; }
+  double operator()(int r, int c) const { return d_[static_cast<std::size_t>(r * 3 + c)]; }
+
+  CommaInit3 operator<<(double v);
+
+  void set_at(int idx, double v) { d_[static_cast<std::size_t>(idx)] = v; }
+
+  Vector3d operator*(const Vector3d & v) const
+  {
+    Vector3d out;
+    for (int r = 0; r < 3; ++r) {
+      out(r) = (*this)(r, 0) * v(0) + (*this)(r, 1) * v(1) + (*this)(r, 2) * v(2);
+    }
+    return out;
+  }
+
+private:
+  std::array<double, 9> d_{};
+};
+
+inline CommaInit3 & CommaInit3::operator,(double v)
+{
+  m_->set_at(idx_++, v);
+  return *this;
+}
+
+inline CommaInit3 Matrix3d::operator<<(double v)
+{
+  set_at(0, v);
+  return CommaInit3(this, 1);
+}
+
+// ---------------------------------------------------------------------------
+class Matrix4d
+{
+public:
+  Matrix4d() { d_.fill(0.0); }
+
+  static Matrix4d Identity()
+  {
+    Matrix4d m;
+    for (int i = 0; i < 4; ++i) { m(i, i) = 1.0; }
+    return m;
+  }
+
+  double & operator()(int r, int c) { return d_[static_cast<std::size_t>(r * 4 + c)]; }
+  double operator()(int r, int c) const { return d_[static_cast<std::size_t>(r * 4 + c)]; }
+
+  template<int BR, int BC>
+  Matrix3d block(int r0, int c0) const
+  {
+    static_assert(BR == 3 && BC == 3, "垫片只实现了 3x3 的 block");
+    Matrix3d m;
+    for (int r = 0; r < 3; ++r) {
+      for (int c = 0; c < 3; ++c) {
+        m(r, c) = (*this)(r0 + r, c0 + c);
+      }
+    }
+    return m;
+  }
+
+private:
+  std::array<double, 16> d_{};
+};
+
+}  // namespace Eigen
+
+#endif  // HOST_SHIM_EIGEN_CORE

@@ -1,0 +1,7 @@
+uint8 cmd                      # PumpCommand.CMD_*
+uint8 mode                     # PumpCommand.MODE_*
+float32 value                  # duty 或 target_pressure，随 mode 变化
+---
+bool  success
+float32 pressure
+string message
