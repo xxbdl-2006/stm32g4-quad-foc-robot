@@ -1,0 +1,315 @@
+<?xml version="1.0"?>
+<!--
+  hwb_arm4.urdf.xacro
+  HWB-ARM4 —— 四自由度 SCARA 型协作机械臂的机器描述。
+
+  机构（尺寸必须与 arm_control/arm_model.hpp 的 ArmGeometry 完全一致，
+        以及 firmware 的关节限位一致，否则 RViz 里的臂形与真实运动对不上）
+  ----------------------------------------------------------------------
+    关节 0  joint_1  基座回转   revolute  ∥ Z    ±180°
+    关节 1  joint_2  大臂回转   revolute  ∥ Z    ±150°
+    关节 2  joint_3  小臂回转   revolute  ∥ Z    ±150°
+    关节 3  joint_4  升降       prismatic ∥ Z    0 ~ -135 mm
+
+  这里最容易错的地方是 a1 被放在了 link_1 里而不是 joint_2 的 origin 上：
+  标准 D-H 的 T_1 = Rz(θ1)·Tz(d1)·Tx(a1)，也就是说"从 J1 轴到 J2 轴的那一段"
+  是跟着 θ1 转、不跟着 θ2 转的，它属于 link_1（基座回转体 + 大臂一体）。
+  如果按直观理解把 a1 当成 joint_2 之后的"大臂长度"，RViz 里的臂会短一截，
+  而且末端位置会比真实值少 (a1 在该方向上的投影) —— 表现是"标定时总有几厘米
+  的系统偏差，怎么调相机都对不上"。
+
+  为什么要声明 <command_interface> / <state_interface>
+  --------------------------------------------------
+  ros2_control 会按这里声明的接口导出句柄，hw_ros2_control 的 on_init 会
+  按这里做校验，缺 velocity 直接拒绝启动。所以这里的接口列表是"契约"。
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="hwb_arm4">
+
+  <xacro:arg name="can_interface" default="can0"/>
+  <xacro:arg name="use_ros2_control" default="false"/>
+
+  <!-- ================= 全局参数（与 arm_model.hpp 一一对应） ================= -->
+  <xacro:property name="a1"      value="0.180"/>   <!-- 大臂：J1 轴 -> J2 轴 -->
+  <xacro:property name="a2"      value="0.180"/>   <!-- 小臂：J2 轴 -> J3 轴 -->
+  <xacro:property name="a3"      value="0.060"/>   <!-- 腕部：J3 轴 -> 吸盘中心 -->
+  <xacro:property name="d1"      value="0.140"/>   <!-- 基座高度：台面 -> 回转平面 -->
+  <xacro:property name="lift_lo" value="-0.135"/>  <!-- 升降下限（到台面上方 5mm） -->
+  <xacro:property name="lift_hi" value="0.000"/>   <!-- 升降上限（= 回转平面，机械死挡） -->
+
+  <xacro:property name="j1_limit" value="3.14159265"/>
+  <xacro:property name="j2_limit" value="2.61799388"/>
+  <xacro:property name="j3_limit" value="2.61799388"/>
+
+  <!-- 相机：固定在工作台上方俯视（eye-to-hand） -->
+  <xacro:property name="cam_x"   value="0.0"/>
+  <xacro:property name="cam_y"   value="0.500"/>   <!-- 光轴在工作区中心上方 -->
+  <xacro:property name="cam_z"   value="0.600"/>   <!-- 台面上方 600mm -->
+
+  <!-- ================= 惯性宏 ================= -->
+  <xacro:macro name="box_inertia" params="m x y z">
+    <inertial>
+      <mass value="${m}"/>
+      <inertia ixx="${m*(y*y+z*z)/12.0}" ixy="0"
+               ixz="0" iyy="${m*(x*x+z*z)/12.0}"
+               iyz="0" izz="${m*(x*x+y*y)/12.0}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="cyl_inertia" params="m r h">
+    <inertial>
+      <mass value="${m}"/>
+      <inertia ixx="${m*(3.0*r*r+h*h)/12.0}" ixy="0" ixz="0"
+               iyy="${m*(3.0*r*r+h*h)/12.0}" iyz="0"
+               izz="${m*r*r/2.0}"/>
+    </inertial>
+  </xacro:macro>
+
+  <!-- ================= 材质 ================= -->
+  <material name="base_grey">  <color rgba="0.30 0.32 0.35 1.0"/></material>
+  <material name="arm_silver"> <color rgba="0.72 0.74 0.78 1.0"/></material>
+  <material name="wrist_dark"> <color rgba="0.18 0.18 0.20 1.0"/></material>
+  <material name="cup_amber">  <color rgba="0.92 0.62 0.10 1.0"/></material>
+  <material name="cam_blue">   <color rgba="0.20 0.45 0.85 1.0"/></material>
+  <material name="table_wood"> <color rgba="0.55 0.43 0.32 1.0"/></material>
+
+  <!-- ================= 工作台（纯视觉参考，不参与运动学） ================= -->
+  <link name="table_link">
+    <visual>
+      <origin xyz="0 0 -0.008" rpy="0 0 0"/>
+      <geometry><box size="1.20 1.20 0.016"/></geometry>
+      <material name="table_wood"/>
+    </visual>
+  </link>
+  <joint name="table_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="table_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ================= base_link：基座固定部分 ================= -->
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 ${d1/2.0}" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.060" length="${d1}"/></geometry>
+      <material name="base_grey"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${d1/2.0}" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.060" length="${d1}"/></geometry>
+    </collision>
+    <xacro:cyl_inertia m="3.20" r="0.060" h="${d1}"/>
+  </link>
+
+  <!-- ================= joint_1：基座回转 =================
+       D-H 的 T_1 = Rz(θ1)·Tz(d1)·Tx(a1)，所以：
+         · joint_1 的 origin 只承担 Tz(d1)，旋转由关节自己做
+         · a1（到 J2 轴的距离）在这一级里作为刚体偏移出现，也就是
+           它属于 link_1 —— 这是本文件开头强调过的那个坑
+  -->
+  <link name="link_1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.048" length="0.055"/></geometry>
+      <material name="base_grey"/>
+    </visual>
+    <!-- 大臂：从 J1 轴伸到 J2 轴 -->
+    <visual>
+      <origin xyz="${a1/2.0} 0 0.004" rpy="0 0 0"/>
+      <geometry><box size="${a1} 0.048 0.030"/></geometry>
+      <material name="arm_silver"/>
+    </visual>
+    <collision>
+      <origin xyz="${a1/2.0} 0 0.004" rpy="0 0 0"/>
+      <geometry><box size="${a1} 0.048 0.030"/></geometry>
+    </collision>
+    <xacro:box_inertia m="1.45" x="${a1}" y="0.048" z="0.030"/>
+  </link>
+
+  <joint name="joint_1" type="revolute">
+    <parent link="base_link"/>
+    <child  link="link_1"/>
+    <origin xyz="0 0 ${d1}" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <dynamics damping="0.06" friction="0.10"/>
+    <!-- 谐波减速器 1:50 + 电机峰值力矩，折算到输出轴约 12 N·m -->
+    <limit effort="12.0" velocity="6.0"
+           lower="${-j1_limit}" upper="${j1_limit}"/>
+  </joint>
+
+  <!-- ================= joint_2：大臂回转（承担 a1 之后的 a2 段） ================= -->
+  <link name="link_2">
+    <visual>
+      <origin xyz="${a2/2.0} 0 0.002" rpy="0 0 0"/>
+      <geometry><box size="${a2} 0.040 0.026"/></geometry>
+      <material name="arm_silver"/>
+    </visual>
+    <collision>
+      <origin xyz="${a2/2.0} 0 0.002" rpy="0 0 0"/>
+      <geometry><box size="${a2} 0.040 0.026"/></geometry>
+    </collision>
+    <xacro:box_inertia m="0.95" x="${a2}" y="0.040" z="0.026"/>
+  </link>
+
+  <joint name="joint_2" type="revolute">
+    <parent link="link_1"/>
+    <child  link="link_2"/>
+    <origin xyz="${a1} 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <dynamics damping="0.05" friction="0.08"/>
+    <limit effort="9.0" velocity="6.0"
+           lower="${-j2_limit}" upper="${j2_limit}"/>
+  </joint>
+
+  <!-- ================= joint_3：小臂回转 ================= -->
+  <link name="link_3">
+    <visual>
+      <origin xyz="${a3/2.0} 0 -0.010" rpy="0 0 0"/>
+      <geometry><box size="${a3} 0.052 0.030"/></geometry>
+      <material name="wrist_dark"/>
+    </visual>
+    <collision>
+      <origin xyz="${a3/2.0} 0 -0.010" rpy="0 0 0"/>
+      <geometry><box size="${a3} 0.052 0.030"/></geometry>
+    </collision>
+    <xacro:box_inertia m="0.35" x="${a3}" y="0.052" z="0.030"/>
+  </link>
+
+  <joint name="joint_3" type="revolute">
+    <parent link="link_2"/>
+    <child  link="link_3"/>
+    <origin xyz="${a2} 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <dynamics damping="0.04" friction="0.06"/>
+    <limit effort="5.0" velocity="8.0"
+           lower="${-j3_limit}" upper="${j3_limit}"/>
+  </joint>
+
+  <!-- ================= joint_4：升降（prismatic，单位 m） =================
+       丝杠导程 10mm 的滚珠丝杠 + 无刷电机直连。驱动板只知道"转了多少弧度"，
+       米与丝杠转角的换算在 arm_control（lift_to_motor_rad）。
+       这里声明 prismatic，位置单位必须是**米** —— 与 /joint_states 里
+       arm_control 发布的 J4 位置单位一致，否则 RViz 里升降轴会以 60 倍的
+       幅度运动（1 圈丝杠 = 2π rad = 10mm）。
+  -->
+  <link name="tool_link">
+    <visual>
+      <origin xyz="0 0 -0.020" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.012" length="0.040"/></geometry>
+      <material name="cup_amber"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.020" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.012" length="0.040"/></geometry>
+    </collision>
+    <xacro:cyl_inertia m="0.09" r="0.012" h="0.040"/>
+  </link>
+
+  <joint name="joint_4" type="prismatic">
+    <parent link="link_3"/>
+    <child  link="tool_link"/>
+    <origin xyz="${a3} 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <dynamics damping="0.30" friction="0.40"/>
+    <!-- 行程 135mm（0 = 回转平面，-0.135 = 台面上方 5mm） -->
+    <limit effort="120.0" velocity="0.50"
+           lower="${lift_lo}" upper="${lift_hi}"/>
+  </joint>
+
+  <!-- tool0：吸盘中心。与 arm_control 的运动学末端点重合，
+       也是 /arm/tool_pose 与 /arm/target_pose 表达的那个点。 -->
+  <link name="tool0"/>
+  <joint name="tool0_joint" type="fixed">
+    <parent link="tool_link"/>
+    <child  link="tool0"/>
+    <origin xyz="0 0 -0.040" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ================= 气泵（固定在基座旁，不参与运动学） ================= -->
+  <link name="pump_link">
+    <visual>
+      <origin xyz="0 0 0.035" rpy="0 0 0"/>
+      <geometry><box size="0.110 0.070 0.070"/></geometry>
+      <material name="wrist_dark"/>
+    </visual>
+    <xacro:box_inertia m="0.62" x="0.110" y="0.070" z="0.070"/>
+  </link>
+  <joint name="pump_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="pump_link"/>
+    <origin xyz="-0.130 0.090 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ================= 相机（固定在工作台上方，eye-to-hand） =================
+       camera_link 的坐标轴与基座一致（x 前、y 左、z 上），所以它相对
+       base_link 只有平移。
+       camera_optical_joint 的 rpy=(π,0,0) 是**关键**：相机俯视时
+         x_optical = +x_base（图像 u 随 +x 增大）
+         y_optical = -y_base（图像 v 随 -y 增大）
+         z_optical = -z_base（光轴朝下）
+       这个矩阵行列式 +1，是合法旋转。若写成 diag(1,1,-1) 就是镜像，
+       四元数表达不出来 —— 投影会静默地左右反，抓取点偏到镜像位置。
+  -->
+  <link name="camera_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.030 0.060 0.060"/></geometry>
+      <material name="cam_blue"/>
+    </visual>
+    <xacro:box_inertia m="0.075" x="0.030" y="0.060" z="0.060"/>
+  </link>
+
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="camera_link"/>
+    <origin xyz="${cam_x} ${cam_y} ${cam_z}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="camera_optical_frame"/>
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child  link="camera_optical_frame"/>
+    <origin xyz="0 0 0" rpy="3.14159265 0 0"/>
+  </joint>
+
+  <!-- ================= ros2_control 硬件段 ================= -->
+  <xacro:if value="$(arg use_ros2_control)">
+    <ros2_control name="HwbSystem" type="system">
+      <hardware>
+        <plugin>hw_ros2_control/HwbSystem</plugin>
+        <param name="can_interface">$(arg can_interface)</param>
+        <param name="invert_direction">false</param>
+        <param name="send_enable_on_activate">true</param>
+        <!-- 三个回转轴由谐波减速器 1:50 直连，驱动板报的就是输出轴角度，
+             所以减速比填 1.0；J4 是丝杠轴，驱动板报丝杠转角，
+             米/弧度的换算在 arm_control 里做，这里同样填 1.0 -->
+        <param name="gear_ratio_joint_1">1.0</param>
+        <param name="gear_ratio_joint_2">1.0</param>
+        <param name="gear_ratio_joint_3">1.0</param>
+        <param name="gear_ratio_joint_4">1.0</param>
+        <!-- 电流上限与 arm_control 的 current.nominal 对应 -->
+        <param name="current_limit_joint_1">4.0</param>
+        <param name="current_limit_joint_2">3.5</param>
+        <param name="current_limit_joint_3">2.5</param>
+        <param name="current_limit_joint_4">1.5</param>
+      </hardware>
+
+      <xacro:macro name="arm_ifaces" params="idx">
+        <joint name="joint_${idx}">
+          <command_interface name="position"/>
+          <command_interface name="velocity"/>
+          <command_interface name="effort"/>
+          <state_interface name="position"/>
+          <state_interface name="velocity"/>
+          <state_interface name="effort"/>
+          <state_interface name="temperature"/>
+        </joint>
+      </xacro:macro>
+
+      <xacro:arm_ifaces idx="1"/>
+      <xacro:arm_ifaces idx="2"/>
+      <xacro:arm_ifaces idx="3"/>
+      <xacro:arm_ifaces idx="4"/>
+    </ros2_control>
+  </xacro:if>
+
+</robot>

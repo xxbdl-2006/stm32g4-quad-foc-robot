@@ -62,12 +62,12 @@ Visualization Manager:
       Frames:
         All Enabled: true
 
-    # ---- 里程计轨迹 ----
+    # ---- 关节轨迹参考（robot_state_publisher 的 TF）----
     - Class: rviz_default_plugins/Odometry
       Name: Odometry
       Enabled: true
       Topic:
-        Value: /odom
+        Value: /base_link
         Depth: 20
         Durability Policy: Volatile
         Reliability Policy: Reliable
@@ -89,7 +89,7 @@ Visualization Manager:
         Head Length: 0.06
         Head Radius: 0.04
 
-    # ---- 相机位姿：把 /camera/sync_joint_states 的关节角画成 4 个小箭头。
+    # ---- 关节角：把 /camera/sync_joint_states 的关节角画成 4 个小箭头。
     #      注意这是**关节角**的可视化，不是笛卡尔位姿（见 CameraSync.msg 注释）。
     - Class: rviz_default_plugins/PoseArray
       Name: CameraSyncPose
@@ -110,7 +110,7 @@ Visualization Manager:
 
   Global Options:
     Background Color: 48; 48; 48
-    Fixed Frame: odom
+    Fixed Frame: base_link
     Frame Rate: 30
 
   Tools:

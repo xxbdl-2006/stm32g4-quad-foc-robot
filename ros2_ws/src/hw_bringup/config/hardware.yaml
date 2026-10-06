@@ -1,7 +1,7 @@
 # ============================================================================
 #  硬件参数总表
 #
-#  这份文件里的每一个值都在驱动板固件里有对应的默认值
+#  这份文件里的每一个电气值都在驱动板固件里有对应的默认值
 #  （见 firmware/Core/Src/param.c 的 param_load_defaults）。
 #  两边不一致时以**固件**为准运行，本文件只决定上位机侧的解读方式。
 #  真正的持久化参数（PID、编码器零点）必须通过 /hw/save_params 写入驱动板
@@ -19,52 +19,80 @@
 can_bridge:
   ros__parameters:
     can_interface: "can0"
-    # 反馈汇总频率。驱动板以 200Hz/电机上报，这里 100Hz 聚合发一帧，
+    # 反馈汇总频率。驱动板以 200Hz/关节上报，这里 100Hz 聚合发一帧，
     # 下游控制器足够用，同时把话题流量控制在对 CPU 友好的水平。
     flush_period_ms: 10
     # 超过这个时间没收到心跳就认为驱动板掉线
     heartbeat_timeout_ms: 500
     # 是否把原始 CAN 帧也转发到 /hw/can_raw（调试时才开，会显著增加负载）
     publish_raw: false
-    # 速度模式指令是否自动带 enable 位。上层只发 setpoint 时更方便；
+    # 位置模式指令是否自动带 enable 位。上层只发 setpoint 时更方便；
     # 如果上层自己管理使能（例如用 ros2_control），应设为 false。
     auto_enable_on_cmd: true
     # 用 ros2_control 时置 false，防止两套控制律同时下发运动指令
     motion_output_enabled: true
 
 # ---------------------------------------------------------------------------
-# 底盘控制器
+#  机械臂控制器
+#
+#  这里的机构尺寸必须与 arm_control/arm_model.hpp 的 ArmGeometry 默认值、
+#  以及 URDF 里的 xacro 属性**三处一致**。任何一处不同，症状都是
+#  "RViz 里的臂与真实臂不一样长"或者"末端到位但实际差几厘米"。
+#  改机构时建议直接改 arm_model.hpp（那是运动学唯一的真源），
+#  再同步这里与 URDF 用于显示/校验。
 # ---------------------------------------------------------------------------
-motor_control:
+arm_control:
   ros__parameters:
-    drive_type: "skid_steer"        # skid_steer | mecanum | four_steer
+    # ---- D-H 机构尺寸（m）----
+    a1: 0.180               # 大臂：J1 回转轴 -> J2 回转轴
+    a2: 0.180               # 小臂：J2 回转轴 -> J3 回转轴
+    a3: 0.060               # 腕部：J3 回转轴 -> 吸盘中心
+    d1: 0.140               # 基座高度：工作台面 -> 回转平面
+    lead: 0.010             # J4 滚珠丝杠导程（m/rev）
 
-    # 机械参数（与 URDF 必须一致，否则里程计会系统性偏差）
-    wheel_radius: 0.065             # m
-    track_width: 0.42               # m，左右轮中心距
-    wheel_base: 0.30                # m，前后轴距
-    gear_ratio: 1.0                 # 本车电机直驱
+    # ---- 关节限位 ----
+    # 三个回转轴的编码器装在电机侧、经谐波减速器 1:50，驱动板报的是
+    # 折算后的输出轴角度；J4 是直线轴，单位是米。
+    joint_lower: [-3.14159265, -2.61799388, -2.61799388, -0.135]
+    joint_upper: [ 3.14159265,  2.61799388,  2.61799388,  0.000]
 
-    max_linear_velocity: 1.20       # m/s
-    max_angular_velocity: 4.00      # rad/s
-    linear_accel_limit: 1.50        # m/s^2，指令斜坡
-    angular_accel_limit: 3.00       # rad/s^2
-    command_rate_hz: 100.0          # 指令下发频率（必须 < 驱动板看门狗频率）
+    # ---- 关节速度/加速度上限（规划用）----
+    # J1 要带动整条手臂，取 1.5 rad/s（≈86°/s）留出力矩余量；
+    # J4 带着吸盘与物块垂直运动，0.15 m/s（丝杠 900rpm）。
+    joint_vel_max: [1.5, 2.0, 2.5, 0.15]
+    joint_acc_max: [3.0, 5.0, 6.0, 0.60]
 
-    # 每轮电流预算（A）。四轮合计会接近 16A，24V 下就是 384W，
-    # 已核对电源选型（明纬 LRS-450-24，450W 余量 17%）。
-    current_budget_per_wheel: 4.0
+    # ---- 四关节共享的电流预算（A）----
+    # 四路驱动共用同一个 24V 母线、同一块散热基板。
+    # total_cap 取 12A 是按 750W/24V 电源（31A）留出一半余量给气泵与浪涌定的：
+    # 气泵启动瞬时能吃到 10A 以上，那一瞬间必须给电机留下至少 12A 的通路，
+    # 否则会触发板卡的欠压保护。
+    current:
+      nominal: [4.0, 3.5, 2.5, 1.5]
+      boost_max: [6.0, 6.0, 6.0, 4.0]
+      total_cap: 12.0
 
-    odom_frame: "odom"
+    # ---- 运行时 ----
+    control_rate_hz: 100.0     # 指令下发频率（必须 < 驱动板看门狗超时 300ms）
+    status_rate_hz: 20.0
+
+    # 安全高度：任何"抬起来再平移"的绕行动作都走这个高度
+    safe_z: 0.120
+
+    home:
+      x: 0.28
+      y: 0.00
+      z: 0.100
+      yaw: 0.0
+
+    # 直线路径不可行时，是否自动改成"抬起 -> 平移 -> 下压"三段绕行
+    auto_waypoint: true
+    speed_scale: 1.0
+
     base_frame: "base_link"
-    publish_tf: true
-
-    # 电机安装方向修正：只要物理上某个轮的转向与解算符号相反就翻这里。
-    # 标定方法见 docs/05_tuning.md 第 4 节。
-    invert_motor_direction: [1, 1, 1, 1]
 
 # ---------------------------------------------------------------------------
-# 相机触发/同步
+#  相机触发/同步
 # ---------------------------------------------------------------------------
 camera_trigger:
   ros__parameters:
@@ -74,10 +102,11 @@ camera_trigger:
     image_topic: "/image_raw"
     match_window_s: 0.040           # 图像与同步事件的配对时间窗
     initial_exposure_delay_s: 0.0012
-    joint_names: ["wheel_0_joint", "wheel_1_joint", "wheel_2_joint", "wheel_3_joint"]
+    joint_names: ["joint_1", "joint_2", "joint_3", "joint_4"]
 
 # ---------------------------------------------------------------------------
-# 气泵（通过 /hw/set_pump 服务使用；这里只是启动时的初始状态）
+#  气泵（通过 /hw/set_pump 服务或 /hw/pump_command 话题使用；
+#        这里只是启动时的初始状态）
 # ---------------------------------------------------------------------------
 pump_bringup:
   ros__parameters:

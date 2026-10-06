@@ -24,6 +24,8 @@ set(MSG_FILES
   msg/DetectedBlockArray.msg
   msg/GraspTarget.msg
   msg/TaskStatus.msg
+  msg/ArmTarget.msg
+  msg/ArmStatus.msg
 )
 
 set(SRV_FILES

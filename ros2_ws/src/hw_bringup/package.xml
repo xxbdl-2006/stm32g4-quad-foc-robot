@@ -4,7 +4,8 @@
   <name>hw_bringup</name>
   <version>2.4.1</version>
   <description>
-    HWB-MC4G4 四轴底盘的启动集成：launch 文件、参数、URDF 与 ros2_control 配置。
+    HWB-ARM4 四自由度 SCARA 机械臂的启动集成：launch 文件、参数、URDF 与
+    ros2_control 配置。
   </description>
   <maintainer email="embedded@hwb.local">HWB Embedded</maintainer>
   <license>Proprietary</license>
@@ -12,13 +13,12 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <exec_depend>hw_can</exec_depend>
-  <exec_depend>motor_control</exec_depend>
+  <exec_depend>arm_control</exec_depend>
   <exec_depend>camera_trigger</exec_depend>
   <exec_depend>hw_ros2_control</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>xacro</exec_depend>
   <exec_depend>controller_manager</exec_depend>
-  <exec_depend>diff_drive_controller</exec_depend>
   <exec_depend>joint_state_broadcaster</exec_depend>
   <exec_depend>velocity_controllers</exec_depend>
   <exec_depend>joint_trajectory_controller</exec_depend>

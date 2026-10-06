@@ -108,7 +108,7 @@ hardware_interface::CallbackReturn HwbSystem::on_configure(
     RCLCPP_FATAL(rclcpp::get_logger("HwbSystem"),
                  "检测到 can_bridge 节点正在下发运动指令（/hw/motor_commands 有发布者）。"
                  "两套控制律会抢同一个电机，拒绝启动。"
-                 "请把 can_bridge 的 motion_output_enabled 设为 false，或停掉 motor_control。");
+                 "请把 can_bridge 的 motion_output_enabled 设为 false，或停掉 arm_control。");
     return hardware_interface::CallbackReturn::ERROR;
   }
 
@@ -176,7 +176,7 @@ hardware_interface::CallbackReturn HwbSystem::on_activate(
   }
   active_ = true;
   last_rx_ = std::chrono::steady_clock::now();
-  RCLCPP_INFO(rclcpp::get_logger("HwbSystem"), "已激活，四轴已使能（速度 0）");
+  RCLCPP_INFO(rclcpp::get_logger("HwbSystem"), "已激活，四个关节已使能（速度 0）");
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 

@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 # ============================================================================
 #  bringup.launch.py
-#  整车启动：CAN 桥 + 底盘控制器 + 相机同步 + 可选遥操作/RViz。
+#  整机启动：CAN 桥 + 机械臂控制器 + 相机同步 + 可选点动工具/RViz。
 #
 #  典型用法
 #  --------
 #    # 第一次跑之前先把 can0 拉起来（需要 root 或 sudo）
 #    ros2 launch hw_bringup bringup.launch.py
 #
-#    # 只跑硬件，不带 RViz 和遥操作（车上部署用）
-#    ros2 launch hw_bringup bringup.launch.py use_rviz:=false use_teleop:=false
+#    # 只跑硬件，不带 RViz 和点动工具
+#    ros2 launch hw_bringup bringup.launch.py use_rviz:=false use_jog:=false
 #
 #    # 用 ros2_control 路径（此时 can_bridge 自动关闭指令下发）
 #    ros2 launch hw_bringup bringup.launch.py use_ros2_control:=true
+#
+#  注意：arm_control 启动后**不会**自己动。要它动必须显式给目标：
+#    ros2 service call /arm/set_enabled std_srvs/srv/SetBool "{data: true}"
+#    ros2 topic pub --once /arm/target_pose hw_msgs/msg/ArmTarget \
+#        "{target_pose: {position: {x: 0.25, y: 0.0, z: 0.11}}, speed_scale: 0.5}" 
 # ============================================================================
 import os
 
@@ -51,7 +56,8 @@ def generate_launch_description():
         DeclareLaunchArgument('use_ros2_control', default_value='false',
                               description='true=走 ros2_control 硬件接口路径'),
         DeclareLaunchArgument('use_rviz', default_value='true'),
-        DeclareLaunchArgument('use_teleop', default_value='true'),
+        DeclareLaunchArgument('use_jog', default_value='true',
+                              description='是否拉起手动点动工具（rqt 关节轨迹控制器）'),
         DeclareLaunchArgument('use_camera', default_value='true'),
         DeclareLaunchArgument('publish_robot_description', default_value='true'),
         DeclareLaunchArgument('use_task', default_value='false',
@@ -89,7 +95,7 @@ def generate_launch_description():
 
     # ---------------------------------------------------------------- 机器描述
     robot_description = Command([
-        'xacro ', PathJoinSubstitution([pkg_bringup, 'urdf', 'hwb_robot.urdf.xacro']),
+        'xacro ', PathJoinSubstitution([pkg_bringup, 'urdf', 'hwb_arm4.urdf.xacro']),
         ' can_interface:=', can_interface,
     ])
 
@@ -139,11 +145,14 @@ def generate_launch_description():
         condition=IfCondition(use_ros2_control),
     )
 
-    # ---------------------------------------------------------------- 底盘控制器
-    motor_control = Node(
-        package='motor_control',
-        executable='motor_control_node',
-        name='motor_control',
+    # ---------------------------------------------------------------- 机械臂控制器
+    # 把"末端要去哪儿"变成"四个关节各转多少"：D-H 正逆解 + 五次多项式 /
+    # 笛卡尔直线轨迹规划。走 ros2_control 路径时由 controller_manager 侧的
+    # joint_trajectory_controller 承担同一职责，所以这里互斥。
+    arm_control = Node(
+        package='arm_control',
+        executable='arm_control_node',
+        name='arm_control',
         output='screen',
         parameters=[config],
         condition=UnlessCondition(use_ros2_control),
@@ -171,9 +180,9 @@ def generate_launch_description():
     )
 
     # ---------------------------------------------------------------- 取放任务层
-    # 【为什么默认关闭】任务层会主动驱动底盘移动。默认关掉，让"跑起来看看"
+    # 【为什么默认关闭】任务层会主动驱动机械臂动作。默认关掉，让"跑起来看看"
     # 和"开始干活"是两个显式的动作 —— 现场调试时最怕的就是起个 launch
-    # 车突然自己动了。
+    # 机械臂突然自己动起来。
     task_layer = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory('hw_task'), 'launch', 'task.launch.py')),
@@ -194,18 +203,27 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_rviz')),
     )
 
-    # ---------------------------------------------------------------- 遥操作
-    # 用 teleop_twist_keyboard 打键盘控制；没装就跳过而不是让整个 launch 挂掉
-    teleop = ExecuteProcess(
+    # ---------------------------------------------------------------- 手动点动
+    # 机械臂没有"遥控器"这一说：末端位置是三维 + 一个绕 Z 的朝向，
+    # 键盘遥操作在这里不适用。首次上电调试用两种办法：
+    #   · ros2_control 路径：rqt_joint_trajectory_controller，滑条直接拖关节角
+    #     （它会自动找 /arm_joint_trajectory_controller，且只在该控制器
+    #       已经激活之后才能操作）
+    #   · 直接节点路径：发一个末端目标
+    #       ros2 topic pub --once /arm/target_pose hw_msgs/msg/ArmTarget \
+    #           "{target_pose: {position: {x: 0.28, y: 0.0, z: 0.10}}, speed_scale: 0.3}"
+    # 没装 rqt 就跳过，而不是让整个 launch 挂掉。
+    jog = ExecuteProcess(
         cmd=['bash', '-lc',
-             'if ros2 pkg prefix teleop_twist_keyboard >/dev/null 2>&1; then '
-             '  exec ros2 run teleop_twist_keyboard teleop_twist_keyboard '
-             '       --ros-args -r cmd_vel:=/cmd_vel; '
+             'if ros2 pkg prefix rqt_joint_trajectory_controller >/dev/null 2>&1; then '
+             '  echo "[hw_bringup] 点动工具：rqt_joint_trajectory_controller"; '
+             '  exec ros2 run rqt_joint_trajectory_controller rqt_joint_trajectory_controller; '
              'else '
-             '  echo "[hw_bringup] 未安装 teleop_twist_keyboard，跳过遥操作节点"; '
+             '  echo "[hw_bringup] 未安装 rqt_joint_trajectory_controller，跳过点动工具"; '
+             '  echo "[hw_bringup] 可直接发末端目标（见 bringup.launch.py 头部注释）"; '
              'fi'],
         output='screen',
-        condition=IfCondition(LaunchConfiguration('use_teleop')),
+        condition=IfCondition(LaunchConfiguration('use_jog')),
     )
 
     # ---------------------------------------------------------------- 启动时序
@@ -230,12 +248,12 @@ def generate_launch_description():
             robot_state_publisher,
             can_bridge,
             can_bridge_feedback_only,
-            motor_control,
+            arm_control,
             camera_trigger,
             ros2_control,
             task_layer,
             rviz,
-            teleop,
+            jog,
             health_check,
         ]
     )

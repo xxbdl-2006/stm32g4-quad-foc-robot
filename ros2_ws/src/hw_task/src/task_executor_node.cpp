@@ -3,24 +3,33 @@
 //  把 TaskSequencer 接到 ROS 上：喂传感器、执行动作、发布状态。
 //
 //  这个文件刻意只做"翻译"，不含任何决策逻辑 —— 所有 if/else 都在
-//  task_sequencer.cpp 里。这样比赛的流程改动只需要动那一个文件。
+//  task_sequencer.cpp 里。这样现场改流程只需要动那一个文件，
+//  而且改完可以先在 PC 上跑回归再上机。
 //
 //  依赖的关键上游
 //  --------------
-//    /detected_blocks        block_detector_node（视觉）
-//    /hw/camera_sync         驱动板硬同步锁存的四轮位姿（时间基准）
-//    /hw/motor_states        轮速/电流/故障
+//    /detected_blocks        block_detector_node（视觉）——只给像素与颜色
+//    /hw/camera_sync         驱动板硬同步的帧事件（时间基准、丢帧统计）
+//    /arm/status             arm_control：末端实测位姿与速度、ik_ok
 //    /hw/pump_state          真空压力反馈（判定是否吸住）
 //    /hw/board_state         母线电压、板级故障
-//    /odom                   motor_control 的里程计 + TF odom->base_link
 //
 //  下发的
 //  ------
-//    /cmd_vel                底盘速度
+//    /arm/target_pose        末端目标位姿（arm_control 负责逆解与轨迹规划）
 //    /hw/pump_command        气泵（真空吸盘）
 //    /task_status            状态机状态
-//    /grasp_targets          当前视野内的可抓目标（给 RViz/UI 看）
+//    /grasp_targets          当前视野内的可抓目标（给 RViz / 上位机界面看）
+//
+//  一个容易踩的坑：末端目标不能每个周期都发
+//  ----------------------------------------
+//  arm_control 收到目标就重新规划一条从当前位置到目标的轨迹。如果每 20ms
+//  重复发同一个目标，就会每个周期重规划一次，而轨迹起点一直在动 ——
+//  末端会持续抖动而且永远"到不了"。所以只有 Actuation.set_pose 为真
+//  （也就是状态机确实换了目标点）时才发。这个判断在状态机里做，
+//  这一层照做即可。
 // ============================================================================
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <memory>
@@ -28,13 +37,12 @@
 #include <string>
 #include <vector>
 
+#include <rclcpp/rclcpp.hpp>
+
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
-#include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
-#include <geometry_msgs/msg/twist.hpp>
-#include <nav_msgs/msg/odometry.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
@@ -42,11 +50,12 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
+#include "hw_msgs/msg/arm_status.hpp"
+#include "hw_msgs/msg/arm_target.hpp"
 #include "hw_msgs/msg/board_state.hpp"
 #include "hw_msgs/msg/camera_sync.hpp"
 #include "hw_msgs/msg/detected_block_array.hpp"
 #include "hw_msgs/msg/grasp_target.hpp"
-#include "hw_msgs/msg/motor_state_array.hpp"
 #include "hw_msgs/msg/pump_command.hpp"
 #include "hw_msgs/msg/pump_state.hpp"
 #include "hw_msgs/msg/task_status.hpp"
@@ -55,7 +64,7 @@
 #include "hw_msgs/srv/start_task.hpp"
 
 #include "hw_task/block_tracker.hpp"
-#include "hw_task/ground_projection.hpp"
+#include "hw_task/table_projection.hpp"
 #include "hw_task/task_sequencer.hpp"
 
 using namespace std::chrono_literals;
@@ -75,9 +84,9 @@ public:
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     // ---------------- 发布 ----------------
-    pub_cmd_    = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
-    pub_pump_   = create_publisher<hw_msgs::msg::PumpCommand>("/hw/pump_command", 10);
-    pub_status_ = create_publisher<hw_msgs::msg::TaskStatus>("/task_status", 10);
+    pub_target_  = create_publisher<hw_msgs::msg::ArmTarget>("/arm/target_pose", 10);
+    pub_pump_    = create_publisher<hw_msgs::msg::PumpCommand>("/hw/pump_command", 10);
+    pub_status_  = create_publisher<hw_msgs::msg::TaskStatus>("/task_status", 10);
     pub_targets_ = create_publisher<geometry_msgs::msg::PoseArray>("/grasp_targets", 10);
 
     // ---------------- 订阅 ----------------
@@ -89,9 +98,9 @@ public:
       "/hw/camera_sync", rclcpp::QoS(20),
       [this](hw_msgs::msg::CameraSync::SharedPtr m) { on_camera_sync(m); });
 
-    sub_motors_ = create_subscription<hw_msgs::msg::MotorStateArray>(
-      "/hw/motor_states", rclcpp::QoS(10),
-      [this](hw_msgs::msg::MotorStateArray::SharedPtr m) { on_motors(m); });
+    sub_arm_ = create_subscription<hw_msgs::msg::ArmStatus>(
+      "/arm/status", rclcpp::QoS(20),
+      [this](hw_msgs::msg::ArmStatus::SharedPtr m) { on_arm(m); });
 
     sub_board_ = create_subscription<hw_msgs::msg::BoardState>(
       "/hw/board_state", rclcpp::QoS(10),
@@ -100,10 +109,6 @@ public:
     sub_pump_state_ = create_subscription<hw_msgs::msg::PumpState>(
       "/hw/pump_state", rclcpp::QoS(10),
       [this](hw_msgs::msg::PumpState::SharedPtr m) { on_pump_state(m); });
-
-    sub_odom_ = create_subscription<nav_msgs::msg::Odometry>(
-      "/odom", rclcpp::QoS(20),
-      [this](nav_msgs::msg::Odometry::SharedPtr m) { on_odom(m); });
 
     // ---------------- 服务 ----------------
     srv_start_ = create_service<hw_msgs::srv::StartTask>(
@@ -130,7 +135,7 @@ public:
     srv_pause_ = create_service<std_srvs::srv::Trigger>(
       "/task/pause",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+             std_srvs::srv::Trigger::Response::SharedPtr res) {
         const bool ok = seq_.pause(snapshot());
         res->success = ok;
         res->message = ok ? "已暂停" : "当前状态无法暂停";
@@ -138,8 +143,8 @@ public:
 
     srv_resume_ = create_service<std_srvs::srv::Trigger>(
       "/task/resume",
-      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+      [this](const std_srvs::srv::Trigger::Request::SharedPtr,
+             std_srvs::srv::Trigger::Response::SharedPtr res) {
         const bool ok = seq_.resume(snapshot());
         res->success = ok;
         res->message = ok ? "已恢复" : "当前状态无法恢复";
@@ -152,11 +157,10 @@ public:
       [this]() { control_loop(); });
 
     RCLCPP_INFO(get_logger(),
-                "任务执行器就绪：控制 %0.0f Hz，可抓范围 %.2f~%.2f m / ±%.0f°，"
-                "投放阵列起点 (%.2f, %.2f) 间距 %.3f m",
-                rate, cfg_.grasp_radius_min, cfg_.grasp_radius_max,
-                cfg_.grasp_bearing_max * 180.0 / M_PI,
-                cfg_.place_x, cfg_.place_y, cfg_.place_pitch);
+                "任务执行器就绪：控制 %0.0f Hz，工作半径 %.2f~%.2f m，"
+                "悬停高度 %.3f m，投放点 (%.2f, %.2f)",
+                rate, cfg_.reach_radius_min, cfg_.reach_radius_max,
+                cfg_.hover_z, cfg_.place_x, cfg_.place_y);
     RCLCPP_INFO(get_logger(),
                 "启动任务： ros2 service call /task/start hw_msgs/srv/StartTask "
                 "\"{max_blocks: 5, require_stable: true}\"");
@@ -181,78 +185,81 @@ private:
     K.k2 = p("camera.k2", 0.0);
     projection_.set_intrinsics(K);
 
-    // 相机光学系在 odom 里的位姿来自 TF，不需要在这里配外参 ——
-    // 外参在 URDF 里（camera_joint 的 origin + camera_optical_joint 的 rpy）。
-    // 这么做的意义是：改机械结构只需要改 URDF，投影链路自动跟随。
-    odom_frame_ = p("odom_frame", std::string("odom"));
+    /* 相机外参来自 TF（URDF 里的 camera_joint + camera_optical_joint），
+     * 这里不配外参。意义是：相机是装在工作台支架上还是装在末端上，
+     * 只影响 URDF，投影链路一行都不用改。 */
+    base_frame_ = p("base_frame", std::string("base_link"));
     camera_frame_ = p("camera_frame", std::string("camera_optical_frame"));
 
-    // ---- 视觉判据（对应 demo 的 min_area=2000 / max_area=30000）----
+    // ---- 视觉判据（沿用 demo 的 min_area=2000 / max_area=30000）----
     cfg_.min_area_px       = static_cast<float>(p("vision.min_area_px", 2000.0));
     cfg_.max_area_px       = static_cast<float>(p("vision.max_area_px", 30000.0));
     cfg_.min_confidence    = static_cast<float>(p("vision.min_confidence", 0.55));
     cfg_.min_stable_frames = static_cast<uint32_t>(p("vision.min_stable_frames", 3L));
 
     TrackerConfig tc;
-    tc.match_radius        = p("tracker.match_radius", 0.060);
-    tc.min_stable_frames   = cfg_.min_stable_frames;
-    tc.max_missing_frames  = static_cast<uint32_t>(p("tracker.max_missing_frames", 5L));
-    tc.track_ttl           = p("tracker.track_ttl", 20.0);
+    tc.match_radius       = p("tracker.match_radius", 0.040);
+    tc.min_stable_frames  = cfg_.min_stable_frames;
+    tc.max_missing_frames = static_cast<uint32_t>(p("tracker.max_missing_frames", 5L));
+    tc.track_ttl          = p("tracker.track_ttl", 20.0);
     tracker_.configure(tc);
 
-    // ---- 可抓范围 ----
-    cfg_.grasp_radius_min  = static_cast<float>(p("grasp.radius_min", 0.18));
-    cfg_.grasp_radius_max  = static_cast<float>(p("grasp.radius_max", 0.85));
-    cfg_.grasp_bearing_max = static_cast<float>(p("grasp.bearing_max", 0.60));
+    // ---- 可达范围与末端高度 ----
+    cfg_.reach_radius_min = static_cast<float>(p("reach.radius_min", 0.12));
+    cfg_.reach_radius_max = static_cast<float>(p("reach.radius_max", 0.40));
+    cfg_.hover_z          = static_cast<float>(p("height.hover_z", 0.050));
+    cfg_.touch_z          = static_cast<float>(p("height.touch_z", 0.023));
+    cfg_.travel_z         = static_cast<float>(p("height.travel_z", 0.100));
+    cfg_.retreat_z        = static_cast<float>(p("height.retreat_z", 0.080));
 
-    // ---- 运动 ----
-    cfg_.approach_speed    = static_cast<float>(p("motion.approach_speed", 0.35));
-    cfg_.align_speed       = static_cast<float>(p("motion.align_speed", 0.09));
-    cfg_.scan_yaw_rate     = static_cast<float>(p("motion.scan_yaw_rate", 0.45));
-    cfg_.standoff          = static_cast<float>(p("motion.standoff", 0.34));
-    cfg_.standoff_tol      = static_cast<float>(p("motion.standoff_tol", 0.030));
-    cfg_.bearing_tol       = static_cast<float>(p("motion.bearing_tol", 0.045));
-    cfg_.yaw_kp            = static_cast<float>(p("motion.yaw_kp", 1.8));
-    cfg_.lateral_kp        = static_cast<float>(p("motion.lateral_kp", 1.6));
-    cfg_.longitudinal_kp   = static_cast<float>(p("motion.longitudinal_kp", 1.2));
-    cfg_.speed_min         = static_cast<float>(p("motion.speed_min", 0.02));
+    // ---- 到位判据 ----
+    cfg_.pos_tol   = static_cast<float>(p("tolerance.pos_m", 0.002));
+    cfg_.vel_tol   = static_cast<float>(p("tolerance.vel_mps", 0.010));
+    cfg_.servo_tol = static_cast<float>(p("tolerance.servo_m", 0.0015));
 
     // ---- 超时 ----
-    cfg_.scan_timeout      = static_cast<float>(p("timeout.scan", 12.0));
-    cfg_.approach_timeout  = static_cast<float>(p("timeout.approach", 15.0));
-    cfg_.align_timeout     = static_cast<float>(p("timeout.align", 8.0));
-    cfg_.settle_time       = static_cast<float>(p("timeout.settle", 0.35));
-    cfg_.descend_time      = static_cast<float>(p("timeout.descend", 0.30));
-    cfg_.grasp_timeout     = static_cast<float>(p("timeout.grasp", 1.5));
-    cfg_.lift_time         = static_cast<float>(p("timeout.lift", 0.40));
-    cfg_.haul_timeout      = static_cast<float>(p("timeout.haul", 45.0));
-    cfg_.place_timeout     = static_cast<float>(p("timeout.place", 15.0));
-    cfg_.release_time      = static_cast<float>(p("timeout.release", 0.50));
-    cfg_.retreat_time      = static_cast<float>(p("timeout.retreat", 1.20));
+    cfg_.scan_timeout        = static_cast<float>(p("timeout.scan", 12.0));
+    cfg_.approach_timeout    = static_cast<float>(p("timeout.approach", 8.0));
+    cfg_.align_timeout       = static_cast<float>(p("timeout.align", 6.0));
+    cfg_.settle_time         = static_cast<float>(p("timeout.settle", 0.30));
+    cfg_.descend_time        = static_cast<float>(p("timeout.descend", 0.25));
+    cfg_.grasp_timeout       = static_cast<float>(p("timeout.grasp", 1.5));
+    cfg_.lift_time           = static_cast<float>(p("timeout.lift", 0.25));
+    cfg_.haul_timeout        = static_cast<float>(p("timeout.haul", 12.0));
+    cfg_.place_timeout       = static_cast<float>(p("timeout.place", 6.0));
+    cfg_.release_time        = static_cast<float>(p("timeout.release", 0.40));
+    cfg_.retreat_time        = static_cast<float>(p("timeout.retreat", 0.60));
     cfg_.vision_lost_timeout = static_cast<float>(p("timeout.vision_lost", 0.60));
 
-    cfg_.max_scan_retry    = static_cast<uint32_t>(p("retry.scan", 3L));
-    cfg_.max_align_retry   = static_cast<uint32_t>(p("retry.align", 2L));
-    cfg_.max_grasp_retry   = static_cast<uint32_t>(p("retry.grasp", 2L));
+    cfg_.max_scan_retry  = static_cast<uint32_t>(p("retry.scan", 3L));
+    cfg_.max_align_retry = static_cast<uint32_t>(p("retry.align", 2L));
+    cfg_.max_grasp_retry = static_cast<uint32_t>(p("retry.grasp", 2L));
 
     // ---- 气泵 ----
-    cfg_.grasp_duty          = static_cast<float>(p("pump.grasp_duty", 1.0));
-    cfg_.hold_duty           = static_cast<float>(p("pump.hold_duty", 0.75));
-    cfg_.use_pressure_check  = p("pump.use_pressure_check", true);
+    cfg_.grasp_duty             = static_cast<float>(p("pump.grasp_duty", 1.0));
+    cfg_.hold_duty              = static_cast<float>(p("pump.hold_duty", 0.75));
+    cfg_.use_pressure_check     = p("pump.use_pressure_check", true);
     cfg_.use_pump_pressure_mode = p("pump.use_pressure_mode", true);
-    cfg_.vacuum_target_kpa   = static_cast<float>(p("pump.vacuum_target_kpa", -25.0));
-    cfg_.vacuum_threshold_kpa = static_cast<float>(p("pump.vacuum_threshold_kpa", 6.0));
+    cfg_.vacuum_target_kpa      = static_cast<float>(p("pump.vacuum_target_kpa", -25.0));
+    cfg_.vacuum_threshold_kpa   = static_cast<float>(p("pump.vacuum_threshold_kpa", 6.0));
 
-    // ---- 投放阵列 ----
-    cfg_.place_x         = p("place.x", 0.0);
-    cfg_.place_y         = p("place.y", 1.20);
-    cfg_.place_yaw       = p("place.yaw", 1.5707963);
-    cfg_.place_pitch     = p("place.pitch", 0.12);
-    cfg_.place_columns   = static_cast<int>(p("place.columns", 4L));
-    cfg_.place_row_pitch = p("place.row_pitch", 0.12);
+    // ---- 投放 ----
+    const std::string mode = p("place.mode", std::string("stack"));
+    cfg_.place_mode          = (mode == "array") ? PlaceMode::Array : PlaceMode::Stack;
+    cfg_.place_x             = p("place.x", 0.28);
+    cfg_.place_y             = p("place.y", -0.14);
+    cfg_.place_yaw           = p("place.yaw", 0.0);
+    cfg_.place_pitch         = p("place.pitch", 0.090);
+    cfg_.place_row_pitch     = p("place.row_pitch", 0.090);
+    cfg_.place_columns       = static_cast<int>(p("place.columns", 3L));
+    cfg_.place_rows          = static_cast<int>(p("place.rows", 3L));
+    cfg_.place_layer_height  = p("place.layer_height", 0.025);
+    cfg_.place_max_layers    = static_cast<int>(p("place.max_layers", 4L));
 
-    cfg_.home_x   = p("home.x", 0.0);
+    // ---- 起点 ----
+    cfg_.home_x   = p("home.x", 0.28);
     cfg_.home_y   = p("home.y", 0.0);
+    cfg_.home_z   = p("home.z", 0.100);
     cfg_.home_yaw = p("home.yaw", 0.0);
 
     publish_targets_ = p("publish_targets", true);
@@ -263,37 +270,35 @@ private:
   // -------------------------------------------------------------------------
   //  传感器汇聚
   // -------------------------------------------------------------------------
-  void on_odom(const nav_msgs::msg::Odometry::SharedPtr m)
+  void on_arm(const hw_msgs::msg::ArmStatus::SharedPtr m)
   {
     std::lock_guard<std::mutex> lk(mtx_);
-    vehicle_x_ = m->pose.pose.position.x;
-    vehicle_y_ = m->pose.pose.position.y;
-    tf2::Quaternion q(m->pose.pose.orientation.x, m->pose.pose.orientation.y,
-                      m->pose.pose.orientation.z, m->pose.pose.orientation.w);
-    double r, pi, ya;
-    tf2::Matrix3x3(q).getRPY(r, pi, ya);
-    vehicle_yaw_ = ya;
-    vehicle_vx_ = m->twist.twist.linear.x;
-    vehicle_wz_ = m->twist.twist.angular.z;
-    have_odom_ = true;
-  }
 
-  void on_motors(const hw_msgs::msg::MotorStateArray::SharedPtr m)
-  {
-    std::lock_guard<std::mutex> lk(mtx_);
-    drive_faulted_ = false;
-    for (const auto & ms : m->motors) {
-      if (ms.state == hw_msgs::msg::MotorState::STATE_FAULT || ms.fault != 0U) {
-        drive_faulted_ = true;
-        break;
-      }
-    }
+    tool_x_ = m->current_pose.pose.position.x;
+    tool_y_ = m->current_pose.pose.position.y;
+    tool_z_ = m->current_pose.pose.position.z;
+    tool_vx_ = m->tool_twist.linear.x;
+    tool_vy_ = m->tool_twist.linear.y;
+    tool_vz_ = m->tool_twist.linear.z;
+
+    /* ik_ok 的语义是"上一个下达的目标被接受了"。刚启动、还没下达过任何目标时
+     * arm_control 报的是 true，正好符合"不需要因为不可达而跳过目标"的默认。 */
+    ik_ok_ = m->ik_ok;
+
+    /* 只有 MOVING/FAULT 才算"机械臂有问题"。
+     * REJECTED 只代表"上一次目标被拒"，那个由 ik_ok 单独承载 ——
+     * 把它也算进 arm_faulted 会让状态机直接判 FAILED 而不是跳过该物块。 */
+    arm_faulted_ = (m->state == hw_msgs::msg::ArmStatus::STATE_FAULT);
+
+    have_arm_ = true;
   }
 
   void on_board(const hw_msgs::msg::BoardState::SharedPtr m)
   {
     std::lock_guard<std::mutex> lk(mtx_);
     board_fault_ = m->fault;
+    // 板级故障也会让关节失去响应，对任务层来说和关节故障等价
+    if (m->fault != 0U) { arm_faulted_ = true; }
   }
 
   void on_pump_state(const hw_msgs::msg::PumpState::SharedPtr m)
@@ -321,13 +326,18 @@ private:
     const rclcpp::Time stamp(m->header.stamp);
 
     // ---- 拿图像时间戳那一刻的相机位姿 ----
-    Eigen::Matrix4d T_oc;
-    if (!lookup_camera_transform(stamp, T_oc)) {
+    /* 相机是固定安装的，这个变换其实是静态的。仍然按图像时间戳查，理由是：
+     *   · 如果将来把相机装到末端上（eye-in-hand），这条链路不用改；
+     *   · 图像在传感器里曝光到发布之间有一段延迟，用"当前时刻"的 TF
+     *     会让每一帧都带上一份与图像不对应的位姿误差。
+     */
+    Eigen::Matrix4d T_bc;
+    if (!lookup_camera_transform(stamp, T_bc)) {
       static int warn_div = 0;
       if ((warn_div++ % 100) == 0) {
         RCLCPP_WARN(get_logger(),
                     "无法在 %f 时刻查到 %s -> %s 的 TF，本帧检测被丢弃",
-                    stamp.seconds(), camera_frame_.c_str(), odom_frame_.c_str());
+                    stamp.seconds(), camera_frame_.c_str(), base_frame_.c_str());
       }
       std::lock_guard<std::mutex> lk(mtx_);
       vision_ok_ = false;
@@ -338,24 +348,25 @@ private:
     obs.reserve(m->blocks.size());
 
     for (const auto & b : m->blocks) {
-      const GroundPoint gp = projection_.project(b.pixel_x, b.pixel_y, T_oc);
-      if (!gp.valid) { continue; }
-      // 地面上的合理范围：太近的东西不在地面（可能是车体自身），太远的超出工作区
-      if (gp.range < 0.05 || gp.range > 8.0) { continue; }
+      const TablePoint tp = projection_.project(b.pixel_x, b.pixel_y, T_bc);
+      if (!tp.valid) { continue; }
+      /* 工作台上的合理范围：太近的（离相机正下方 5cm 内，落在基座法兰上）
+       * 与太远的（超出工作台）都不要。这里的 8m 只是个"离谱值"的兜底，
+       * 真正决定能不能抓的是 cfg_.reach_radius_*。 */
+      if (tp.range < 0.05 || tp.range > 8.0) { continue; }
 
       BlockObservation o;
-      o.pos = Eigen::Vector2d(gp.x, gp.y);
+      o.pos = Eigen::Vector2d(tp.x, tp.y);
       o.color = static_cast<BlockColor>(b.color);
       o.area_px = b.area;
       o.confidence_px = b.confidence;
       o.pixel_x = b.pixel_x;
       o.pixel_y = b.pixel_y;
 
-      // 物块长边像素长度：由面积和长宽比反推不可靠，这里用 sqrt(area) 作为
-      // 特征长度。斜俯视下它会随距离变化，但 project_yaw 只用它来定方向，
-      // 长度误差只带来很小的角度误差（一阶小量）。
+      // 物块长边方向。吸盘是圆形的，用不到它，但它在 RViz 里能直观
+      // 显示"视觉认为物块朝哪边"，标定时很有用。
       const double length_px = std::sqrt(std::max(1.0f, b.area));
-      o.yaw = projection_.project_yaw(b.pixel_x, b.pixel_y, b.yaw, length_px, T_oc);
+      o.yaw = projection_.project_yaw(b.pixel_x, b.pixel_y, b.yaw, length_px, T_bc);
       obs.push_back(o);
     }
 
@@ -367,19 +378,17 @@ private:
     }
   }
 
-  /// 查 camera_optical_frame -> odom 的 4x4 变换
+  /// 查 camera_optical_frame -> base_link 的 4x4 变换
   bool lookup_camera_transform(const rclcpp::Time & stamp, Eigen::Matrix4d & out)
   {
     geometry_msgs::msg::TransformStamped tf;
     try {
-      tf = tf_buffer_->lookupTransform(odom_frame_, camera_frame_, stamp,
+      tf = tf_buffer_->lookupTransform(base_frame_, camera_frame_, stamp,
                                        rclcpp::Duration::from_seconds(0.05));
     } catch (const tf2::TransformException &) {
-      // 时间戳太新（TF 还没跟上）时退回最新可用值。这会让投影带上
-      // "最近一帧里程计"的误差，但总比丢帧好 —— 而且这个分支在正常
-      // 运行时不应该被走到（图像时间戳必然早于当前时间）。
+      // 时间戳太新（静态 TF 还没进入缓冲）时退回最新可用值。
       try {
-        tf = tf_buffer_->lookupTransform(odom_frame_, camera_frame_,
+        tf = tf_buffer_->lookupTransform(base_frame_, camera_frame_,
                                          tf2::TimePointZero);
       } catch (const tf2::TransformException &) {
         return false;
@@ -408,11 +417,13 @@ private:
     std::lock_guard<std::mutex> lk(mtx_);
 
     s.t = now().seconds();
-    s.vehicle_x = vehicle_x_;
-    s.vehicle_y = vehicle_y_;
-    s.vehicle_yaw = vehicle_yaw_;
-    s.vehicle_vx = vehicle_vx_;
-    s.vehicle_wz = vehicle_wz_;
+
+    s.tool_x = tool_x_;
+    s.tool_y = tool_y_;
+    s.tool_z = tool_z_;
+    s.tool_vx = tool_vx_;
+    s.tool_vy = tool_vy_;
+    s.tool_vz = tool_vz_;
 
     s.vision_ok = vision_ok_;
     s.blocks_visible = blocks_visible_;
@@ -421,10 +432,10 @@ private:
     s.pump_pressure_kpa = pump_pressure_;
     s.pump_fault = pump_fault_;
 
-    s.drive_faulted = drive_faulted_;
-    s.estop = false;      // 急停走 EStop 服务/话题，这里由 Sequencer 的 estop 字段承载
+    s.arm_faulted = arm_faulted_;
+    s.ik_ok = ik_ok_;
+    s.estop = false;      // 急停走 CLS_ESTOP / 服务，不在常规快照里
 
-    // 当前绑定目标（由 pick_target 更新）
     if (bound_) {
       s.target_valid = true;
       s.target_x = bound_pos_.x();
@@ -449,17 +460,19 @@ private:
       return;
     }
 
-    const Eigen::Vector2d veh(s.vehicle_x, s.vehicle_y);
+    /* 参考点取基座回转轴在台面上的投影 (0, 0)：排序与可达性判断都是
+     * "离基座多远"。底盘方案里这里传的是车体位置（还要带车头朝向），
+     * 机械臂没有可移动的机体，基座就是唯一合理的参考点。 */
     const auto excluded = seq_.excluded_ids();
 
     /* tracker_ 的读也走同一把锁。当前用的是单线程 executor，订阅回调与
-     * 定时器回调天然串行，理论上不会有竞态；但只要有任何人把 main() 里的
+     * 定时器回调天然串行，理论上不会有竞态；但只要有人把 main() 里的
      * spin 换成 MultiThreadedExecutor，这里就会变成数据竞争。加锁的成本
      * （纳秒级、无争用）远低于这个潜在风险。 */
     BlockTrack best;
     {
       std::lock_guard<std::mutex> lk(mtx_);
-      best = tracker_.pick(cfg_, veh, s.vehicle_yaw, excluded);
+      best = tracker_.pick(cfg_, Eigen::Vector2d(0.0, 0.0), excluded);
     }
     if (!best.stable) {
       return;
@@ -474,7 +487,7 @@ private:
       bound_conf_ = static_cast<float>(best.confidence);
       bound_id_ = best.id;
     }
-    seq_.bind_target(best.id, best.pos, best.color, best.yaw,
+    seq_.bind_target(best.id, best.pos.x(), best.pos.y(), best.color, best.yaw,
                      static_cast<float>(best.confidence));
   }
 
@@ -483,39 +496,49 @@ private:
   // -------------------------------------------------------------------------
   void apply(const Actuation & a)
   {
-    // ---- 底盘 ----
-    geometry_msgs::msg::Twist cmd;
-    cmd.linear.x = clampd(a.cmd_vx, -0.5, 0.5);
-    cmd.linear.y = clampd(a.cmd_vy, -0.5, 0.5);
-    cmd.angular.z = clampd(a.cmd_wz, -1.5, 1.5);
-    pub_cmd_->publish(cmd);
+    // ---- 末端目标 ----
+    // 只在状态机换了目标点时发（见文件头的说明）
+    if (a.set_pose) {
+      hw_msgs::msg::ArmTarget t;
+      t.header.stamp = now();
+      t.header.frame_id = base_frame_;
+      t.target_pose.position.x = a.pose_x;
+      t.target_pose.position.y = a.pose_y;
+      t.target_pose.position.z = a.pose_z;
+      // 末端只有绕 Z 的一个自由度，四元数里只填 yaw
+      t.target_pose.orientation.z = std::sin(a.pose_yaw * 0.5);
+      t.target_pose.orientation.w = std::cos(a.pose_yaw * 0.5);
+      t.move_kind = hw_msgs::msg::ArmTarget::MOVE_CARTESIAN;
+      t.speed_scale = a.speed_scale;
+      t.allow_waypoint = a.allow_waypoint;
+      pub_target_->publish(t);
+    }
 
     // ---- 气泵 ----
-    if (a.pump_run != last_pump_run_ || std::abs(a.pump_duty - last_pump_duty_) > 0.02) {
+    if (a.pump_run != last_pump_run_) {
       hw_msgs::msg::PumpCommand pc;
       pc.header.stamp = now();
-      pc.cmd = hw_msgs::msg::PumpCommand::CMD_RUN;
-      if (cfg_.use_pump_pressure_mode) {
-        // 让驱动板的压力环去维持真空。target_pressure 用绝对值语义，
-        // 负号由固件的压力环方向处理（见 firmware pump.c 的符号约定）。
-        pc.mode = hw_msgs::msg::PumpCommand::MODE_PRESSURE;
-        pc.target_pressure = cfg_.vacuum_target_kpa;
-        pc.duty = 0.0f;
+      if (a.pump_run) {
+        pc.cmd = hw_msgs::msg::PumpCommand::CMD_RUN;
+        if (cfg_.use_pump_pressure_mode) {
+          /* 让驱动板的压力环去维持真空。target_pressure 用绝对值语义，
+           * 负号由固件的压力环方向处理（见 firmware pump.c 的符号约定）。
+           * 好处是漏气时驱动板自动加大功率，上位机只需看压力是否达标。 */
+          pc.mode = hw_msgs::msg::PumpCommand::MODE_PRESSURE;
+          pc.target_pressure = std::fabs(cfg_.vacuum_target_kpa);
+          pc.duty = 0.0f;
+        } else {
+          pc.mode = hw_msgs::msg::PumpCommand::MODE_OPEN_DUTY;
+          pc.duty = static_cast<float>(a.pump_duty);
+          pc.target_pressure = 0.0f;
+        }
       } else {
+        pc.cmd = hw_msgs::msg::PumpCommand::CMD_STOP;
         pc.mode = hw_msgs::msg::PumpCommand::MODE_OPEN_DUTY;
-        pc.duty = static_cast<float>(a.pump_duty);
-        pc.target_pressure = 0.0f;
+        pc.duty = 0.0f;
       }
       pub_pump_->publish(pc);
       last_pump_run_ = a.pump_run;
-      last_pump_duty_ = a.pump_duty;
-    } else if (!a.pump_run && last_pump_run_) {
-      hw_msgs::msg::PumpCommand pc;
-      pc.header.stamp = now();
-      pc.cmd = hw_msgs::msg::PumpCommand::CMD_STOP;
-      pub_pump_->publish(pc);
-      last_pump_run_ = false;
-      last_pump_duty_ = 0.0;
     }
 
     // ---- 目标切换请求 ----
@@ -531,8 +554,10 @@ private:
   // -------------------------------------------------------------------------
   void control_loop()
   {
-    if (!have_odom_) {
-      RCLCPP_WARN_ONCE(get_logger(), "还没收到 /odom，等待 motor_control 启动");
+    if (!have_arm_) {
+      RCLCPP_WARN_ONCE(get_logger(),
+                       "还没收到 /arm/status，等待 arm_control 启动"
+                       "（它负责给出末端实测位姿，任务层靠它判到位）");
       return;
     }
 
@@ -543,11 +568,6 @@ private:
     const Actuation a = seq_.update(s, 0.0);
     apply(a);
     publish_status(s, a);
-
-    if (a.finished || a.aborted) {
-      // 终态：确保底盘停住、气泵按 Sequencer 的决定执行
-      RCLCPP_INFO(get_logger(), "%s", a.note.c_str());
-    }
   }
 
   // -------------------------------------------------------------------------
@@ -569,16 +589,17 @@ private:
     msg.elapsed = st.elapsed;
     msg.message = st.message;
     msg.pump_pressure = static_cast<float>(s.pump_pressure_kpa);
-    msg.target_distance = st.target_distance;
+    msg.target_range = st.target_range;
     msg.pose_confidence = st.pose_confidence;
     msg.vision_ok = s.vision_ok;
+    msg.place_layer = st.place_layer;
     pub_status_->publish(msg);
 
     // ---- 可抓目标可视化 ----
     if (publish_targets_) {
       geometry_msgs::msg::PoseArray arr;
       arr.header.stamp = now();
-      arr.header.frame_id = odom_frame_;
+      arr.header.frame_id = base_frame_;
 
       std::lock_guard<std::mutex> lk(mtx_);
       const auto stable = tracker_.stable_tracks();
@@ -586,7 +607,7 @@ private:
         geometry_msgs::msg::Pose p;
         p.position.x = tr.pos.x();
         p.position.y = tr.pos.y();
-        p.position.z = 0.0;
+        p.position.z = 0.0;   // 工作台面
         // 用四元数把物块朝向编码进去，RViz 里能看到方块的角度
         const Eigen::Quaterniond q(Eigen::AngleAxisd(tr.yaw, Eigen::Vector3d::UnitZ()));
         p.orientation.x = q.x();
@@ -621,7 +642,7 @@ private:
       RCLCPP_INFO(get_logger(), "任务启动（max_blocks=%u）", sr.max_blocks);
     } else {
       res->planned_targets = 0;
-      res->message = "启动失败：任务已在运行或底盘故障";
+      res->message = "启动失败：任务已在运行，或机械臂处于故障状态";
       RCLCPP_WARN(get_logger(), "任务启动被拒绝：%s", res->message.c_str());
     }
   }
@@ -641,25 +662,25 @@ private:
   void handle_calibrate(const std::shared_ptr<hw_msgs::srv::CalibrateMapping::Request> req,
                         std::shared_ptr<hw_msgs::srv::CalibrateMapping::Response> res)
   {
-    Eigen::Matrix4d T_oc;
-    if (!lookup_camera_transform(now(), T_oc)) {
+    Eigen::Matrix4d T_bc;
+    if (!lookup_camera_transform(now(), T_bc)) {
       res->success = false;
-      res->message = "TF 不可用，无法标定";
+      res->message = "TF 不可用，无法标定（检查 robot_state_publisher 是否在跑）";
       return;
     }
 
     // 用当前残差先算一次投影，得到"校正前"的误差
-    const GroundPoint before = projection_.project(req->pixel_x, req->pixel_y, T_oc);
+    const TablePoint before = projection_.project(req->pixel_x, req->pixel_y, T_bc);
     const float err_before = before.valid
       ? static_cast<float>(std::hypot(before.x - req->world_x, before.y - req->world_y))
       : -1.0f;
 
     const double err_after = projection_.add_calibration_point(
-      req->pixel_x, req->pixel_y, req->world_x, req->world_y, T_oc);
+      req->pixel_x, req->pixel_y, req->world_x, req->world_y, T_bc);
 
     if (err_after < 0.0) {
       res->success = false;
-      res->message = "该像素无法投到地面（超出视野或射线朝天）";
+      res->message = "该像素无法投到工作台面（超出视野或射线朝天）";
       return;
     }
 
@@ -670,7 +691,7 @@ private:
     /* 把"到底解出了什么"告诉调用方。
      * 标定点太少或挤在一起时，完整的 2D 仿射是病态问题，代码会自动退化成
      * 只校正平移。这件事必须让操作员知道 —— 否则他会以为旋转/尺度也校好了，
-     * 而实际上离开标定区域几米之后误差会很大。 */
+     * 而实际上离开标定区域之后误差会迅速变大。 */
     const std::size_t n = projection_.calibration_points();
     const double spread = projection_.calibration_spread();
     if (projection_.affine_solved()) {
@@ -682,31 +703,27 @@ private:
                      " 个标定点，仅校正平移（标定点跨度 " +
                      std::to_string(spread * 100).substr(0, 4) +
                      " cm，小于 " +
-                     std::to_string(GroundProjection::kMinCalibSpread * 100).substr(0, 4) +
-                     " cm）。要校正旋转/尺度请把标定块分散摆到工作区四角再采点。";
+                     std::to_string(TableProjection::kMinCalibSpread * 100).substr(0, 4) +
+                     " cm）。要校正旋转/尺度，请把标定块分散摆到工作台四角再采点。";
     }
 
     RCLCPP_INFO(get_logger(),
-                "标定点 #%zu：像素(%.1f, %.1f) -> 世界(%.3f, %.3f)，误差 %.4f m -> %.4f m，%s",
+                "标定点 #%zu：像素(%.1f, %.1f) -> 台面(%.3f, %.3f)，"
+                "误差 %.4f m -> %.4f m，%s",
                 n, req->pixel_x, req->pixel_y,
                 req->world_x, req->world_y, err_before, err_after,
                 projection_.affine_solved() ? "完整仿射" : "仅平移");
   }
 
-  static double clampd(double v, double lo, double hi)
-  {
-    return v < lo ? lo : (v > hi ? hi : v);
-  }
-
   // -------------------------------------------------------------------------
   //  成员
   // -------------------------------------------------------------------------
-  TaskConfig       cfg_{};
-  TaskSequencer    seq_{};
-  BlockTracker     tracker_{};
-  GroundProjection projection_{};
+  TaskConfig      cfg_{};
+  TaskSequencer   seq_{};
+  BlockTracker    tracker_{};
+  TableProjection projection_{};
 
-  std::string odom_frame_{"odom"};
+  std::string base_frame_{"base_link"};
   std::string camera_frame_{"camera_optical_frame"};
   bool publish_targets_{true};
 
@@ -714,10 +731,11 @@ private:
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   std::mutex mtx_;
-  double vehicle_x_{0.0}, vehicle_y_{0.0}, vehicle_yaw_{0.0};
-  double vehicle_vx_{0.0}, vehicle_wz_{0.0};
-  bool   have_odom_{false};
-  bool   drive_faulted_{false};
+  double tool_x_{0.0}, tool_y_{0.0}, tool_z_{0.0};
+  double tool_vx_{0.0}, tool_vy_{0.0}, tool_vz_{0.0};
+  bool   ik_ok_{true};
+  bool   have_arm_{false};
+  bool   arm_faulted_{false};
   uint16_t board_fault_{0};
 
   bool   pump_online_{false};
@@ -738,20 +756,18 @@ private:
   BlockColor bound_color_{BlockColor::Unknown};
   float    bound_conf_{0.0f};
 
-  bool   last_pump_run_{false};
-  double last_pump_duty_{0.0};
+  bool last_pump_run_{false};
 
-  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr     pub_cmd_;
-  rclcpp::Publisher<hw_msgs::msg::PumpCommand>::SharedPtr     pub_pump_;
-  rclcpp::Publisher<hw_msgs::msg::TaskStatus>::SharedPtr      pub_status_;
-  rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_targets_;
+  rclcpp::Publisher<hw_msgs::msg::ArmTarget>::SharedPtr        pub_target_;
+  rclcpp::Publisher<hw_msgs::msg::PumpCommand>::SharedPtr      pub_pump_;
+  rclcpp::Publisher<hw_msgs::msg::TaskStatus>::SharedPtr       pub_status_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr  pub_targets_;
 
   rclcpp::Subscription<hw_msgs::msg::DetectedBlockArray>::SharedPtr sub_blocks_;
   rclcpp::Subscription<hw_msgs::msg::CameraSync>::SharedPtr         sub_sync_;
-  rclcpp::Subscription<hw_msgs::msg::MotorStateArray>::SharedPtr    sub_motors_;
+  rclcpp::Subscription<hw_msgs::msg::ArmStatus>::SharedPtr          sub_arm_;
   rclcpp::Subscription<hw_msgs::msg::BoardState>::SharedPtr         sub_board_;
   rclcpp::Subscription<hw_msgs::msg::PumpState>::SharedPtr          sub_pump_state_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr          sub_odom_;
 
   rclcpp::Service<hw_msgs::srv::StartTask>::SharedPtr         srv_start_;
   rclcpp::Service<hw_msgs::srv::AbortTask>::SharedPtr         srv_abort_;

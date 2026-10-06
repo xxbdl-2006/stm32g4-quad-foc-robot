@@ -5,7 +5,7 @@
 //  职责
 //  ----
 //  1. 管理驱动板上的触发脉冲输出（通过 /hw/configure_camera 服务）；
-//  2. 订阅 /hw/camera_sync（驱动板在 SYNC 中断里锁存的四轴位置）；
+//  2. 订阅 /hw/camera_sync（驱动板在 SYNC 中断里锁存的四轴关节位置）；
 //  3. 订阅相机图像话题，把图像与最近一次的同步锁存按时间戳配对，
 //     发布 /camera/sync_joint_states —— 也就是"这一帧图像对应的关节角"；
 //  4. 在线测量 SYNC 上升沿到图像就绪的实际延迟，写进诊断信息，
@@ -56,8 +56,7 @@ public:
     image_topic_ = declare_parameter("image_topic", "/image_raw");
     match_window_ = declare_parameter("match_window_s", 0.040);
     joint_names_ = declare_parameter("joint_names",
-      std::vector<std::string>{"wheel_0_joint", "wheel_1_joint",
-                               "wheel_2_joint", "wheel_3_joint"});
+      std::vector<std::string>{"joint_1", "joint_2", "joint_3", "joint_4"});
     exposure_delay_est_ = declare_parameter("initial_exposure_delay_s", 0.0012);
 
     pub_joints_ = create_publisher<sensor_msgs::msg::JointState>(
@@ -188,7 +187,7 @@ private:
     js.header.frame_id = img->header.frame_id;
     for (std::size_t i = 0; i < best.n; ++i) {
       js.name.push_back(i < joint_names_.size() ? joint_names_[i]
-                                                : ("wheel_" + std::to_string(i) + "_joint"));
+                                                : ("joint_" + std::to_string(i + 1)));
       js.position.push_back(best.pos[i]);
       js.velocity.push_back(best.vel[i]);
     }

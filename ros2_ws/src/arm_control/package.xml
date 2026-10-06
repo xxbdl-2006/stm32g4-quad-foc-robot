@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>arm_control</name>
+  <version>1.0.0</version>
+  <description>
+    HWB-ARM4 四自由度 SCARA 型协作机械臂的运动控制层。
+
+    职责：把"末端要去哪儿"变成"四个关节各转多少"。
+      · 标准 D-H 参数表 + 正运动学（关节空间 -> 笛卡尔空间）
+      · 闭式逆运动学（RRPR 几何解，肘上/肘下两解按连续性优选）
+      · 轨迹规划：五次多项式关节空间插值 + 笛卡尔直线路径
+      · 多关节时间同步、关节限速限加速度校验
+      · 按故障状态重新分配四关节共享的电流预算
+
+    运动学与轨迹规划做成不依赖 rclcpp / Eigen 的独立库，可以在没有 ROS、
+    没有运动学库的开发机上直接跑回归测试（test/run_host_test.sh）。
+  </description>
+  <maintainer email="embedded@hwb.local">HWB Embedded</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>hw_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

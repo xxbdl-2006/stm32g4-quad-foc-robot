@@ -1,348 +1,162 @@
-# 任务控制逻辑（视觉引导取放）
+# 取放任务逻辑
 
-参照 `C:\Users\adms\Desktop\睿抗比赛demo` 的取放流程实现，但**不是照抄** —— 因为
-那个 demo 的前提（固定安装的相机 + SCARA 机械臂）与这里（车载相机 + 移动底盘）
-差得很远。本文档说明搬了什么、改了什么、为什么改。
+任务层要做的事一句话就能说完：**看着台面上的物块，把它们一个个搬到指定的位置**。
+这一层是整个系统里"业务"含量最高的部分，也是把视觉、运动学、气路三条线索
+拧在一起的部分。
 
----
+参照物是睿抗（RAICOM）比赛 demo 的取放流程（`~/睿抗比赛demo`）：HSV 分色找物块、
+线性拟合映射到臂基坐标、下降吸附、码垛、放气，循环 5 次。本层沿用了它的任务
+结构，但实现按"四关节伺服总线 + 四自由度 SCARA + 压力反馈"这个前提重做过。
 
-## 一、demo 做了什么
+## 一、与 demo 的逐条对照
 
-三份代码构成一个完整的取放闭环：
+先说前提：demo 的前提（固定安装的相机 + SCARA 机械臂 + 真空吸盘取放）
+与本项目**一致** —— 都是固定相机俯视工作台、SCARA 末端带吸盘。差别在
+实现质量与失败处理上：
 
-| 文件 | 职责 |
+| demo 的做法 | 本项目 | 为什么要改 |
+|---|---|---|
+| `robot_x = 0.0008*obj_y + 0.2563`（两行线性拟合） | 完整投影链路：内参 + 外参（TF）+ 台面求交 + 2D 仿射残差 | 线性拟合把内参、外参、台面高度混进两个碰运气的系数里；重新夹一次相机或换一块厚台面，系数就得重猜，且没有任何指标告诉你猜得对不对 |
+| `ThetaList` 按"同角度出现两次"判稳定 | 工作台坐标系里的最近邻数据关联 + 连续帧计数（`block_tracker`） | 角度匹配会把碰巧同角度的两个物块混成一个；判据里没有空间信息，视觉一旦抖出假目标就会被当成"稳定" |
+| `arm.joint_space_interpolated_motion` 定时插补 | 末端目标位姿 → `arm_control` 闭式逆解 + 五次多项式 / 笛卡尔直线 | 关节插补是开环时间：负载一变就提前或滞后停下。到位判据必须看实测位置与速度 |
+| 下降后固定延时算"吸住了" | 气泵压力反馈判定，搬运途中持续检测掉件 | 压在物块边缘吸空了，demo 要到码垛位才发现手里是空的 |
+| 固定循环 5 次，任何失败直接往下走 | 15 状态机 + 各阶段独立重试 + 补扫 + 中止/暂停/急停 | 比赛现场一半的失败是"某个物块吸不住"，没有失败处理就等于放弃整个任务 |
+| demo 的码垛：同 XY 逐层 +0.055 | 同槽位逐层 `place_layer_height`（`PlaceMode::Stack`），或单层阵列 | 机构有独立升降轴，能真的做码垛；层高按实测物块高度填，不是标称值 |
+| 无测试 | 57 项主机侧检查，用 arm_control 的真实正逆解做闭环仿真（见第五节） | "写完"和"跑通"是两件事 |
+
+## 二、状态机
+
+```
+  IDLE ─start─► SCAN ─找到稳定目标─► APPROACH ─到达悬停位─► ALIGN
+                   ▲                                                │
+                   │                                          SETTLE（等停稳）
+                   │                                                │
+                   │                                           DESCEND（直线下压）
+                   │                                                │
+                   │                                             GRASP
+                   │                                     ┌─────────┴────────┐
+                   │                                 压力达标           超时/重试耗尽
+                   │                                     │                  │
+                   │                                   LIFT              跳过该物块
+                   │                                     │                  │
+                   │                                   HAUL ◄──────────────┘
+                   │                                     │
+                   │                                   PLACE ─下放到位─► RELEASE
+                   │                                     ▲                  │
+                   └──────────── RETREAT ◄──────────────┘                  │
+                       (还有物块)                                           │
+                                                                           │
+                                              (没了 / 配额完成) ──► DONE
+```
+
+各状态的职责与关键判据：
+
+| 状态 | 下发的动作 | 离开的判据 |
+|---|---|---|
+| SCAN | 末端回到待机位（避开相机视野），请求挑选目标 | tracker 给出稳定且落在工作环带内的目标 |
+| APPROACH | 末端 → (物块上方, hover_z)，允许绕行 | 末端在目标点停稳（位置 + 合成速度双条件） |
+| ALIGN | 用最新视觉结果刷新末端目标，速度压到 0.4×，禁止绕行 | 视觉残差 < servo_tol 且末端停稳 |
+| SETTLE | 保持 | settle_time（0.3s，等谐波减速器余振衰减） |
+| DESCEND | 直线下压到 touch_z（2mm 过盈） | 到位 + descend_time |
+| GRASP | 开泵 | 压力绝对值 ≥ vacuum_threshold_kpa |
+| LIFT | 直线抬到 travel_z | 到位 + lift_time，期间再验一次压力 |
+| HAUL | 平移到投放槽位上方（走 travel_z） | 停稳 |
+| PLACE | 直线下放到该层高度 | 停稳 |
+| RELEASE | 停泵放气 | release_time |
+| RETREAT | 垂直抬到 retreat_z | 决定下一个目标 / 回原点 / 收工 |
+
+### 三个容易踩的坑（都写进了代码注释）
+
+1. **末端目标不能每个周期都发**。`arm_control` 收到目标就重新规划轨迹，起点
+   一直在动 → 末端持续抖动且永远"到不了"。所以 `Actuation.set_pose` 只在
+   目标真的变了的那一个周期置位（`goto_pose` 里的死区比较）。这是从
+   "速度指令可以重复下发"换到"位置指令"时最容易漏想的一点。
+2. **扫描时末端必须避开相机视野**。相机固定在工作台上方俯视，机械臂停在
+   工作区中间会把物块挡住 —— 症状是"卡在 SCAN 不动"，看起来像视觉坏了，
+   其实是自己挡了镜头。
+3. **视觉伺服的收敛阈值必须比噪声大**。视觉位置噪声约 1.2mm，servo_tol
+   取 1.5mm。阈值比噪声小的话收敛判据永远不满足，机械臂会在目标附近无限
+   微调下去（表现为"到了但不动"）。
+
+## 三、失败处理
+
+| 情形 | 处理 |
 |---|---|
-| `RK_SCARA_camera.ipynb` | 视觉进程。OpenNI 取流 → 裁 ROI → HSV 分割红/蓝 → 形态学 → `findContours` → `minAreaRect` 得到中心与角度；做 socket **服务端**（localhost:6000） |
-| `calculate_angles.py` | 同一套识别的单机调试版，额外用 Canny + `HoughLinesP` 求物块边的角度，做 5 帧滑动平均 |
-| `RK_SCARA_DEMO.ipynb` / `RK_competiton_procedure.ipynb` | 机器人进程。socket **客户端**，`send('begin')` → 收到 `"x,y"` → 像素映射到机械臂坐标 → 下降吸附 → 抬起 → 移到堆叠位 → 放气 → 回家。循环 5 次 |
+| 扫描超时 | 重试 `max_scan_retry` 次；配额没完成且排除列表非空时，清空列表**补扫一轮**（只补一轮，避免死循环） |
+| 接近/精调超时 | 各自重试 `max_align_retry` 次，超过就把该物块加入排除列表换下一个 |
+| 吸不住 | 重试 `max_grasp_retry` 次（每次回 ALIGN 重新对位），超过就排除该物块 |
+| 连续 5 个物块失败 | 判 FAILED（多半是气路或吸盘坏了，继续试没有意义） |
+| 搬运途中掉件（压力突然消失） | 放弃当前物块，重新扫描。**不**去捡掉落的物块：它躺在不确定的位置、姿态也变了 |
+| 目标超出工作环带 | 直接排除（物块可能只是被摆到了台边） |
+| `arm_control` 拒绝目标（`ik_ok=false`） | 排除该物块 —— 视觉认为可达但运动学不可达 |
+| 急停 / 关节故障 | 立刻 FAILED，释放负载，停所有执行器 |
 
-关键的三段逻辑：
+**重试计数必须按阶段分开**（`scan_fail_ / approach_fail_ / align_fail_ / grasp_fail_`）。
+GRASP 失败后的重试路径要经过 ALIGN，如果共用一个计数器且 ALIGN 成功时清零，
+GRASP 的重试上限永远触发不了 —— 吸不住的物块会让状态机无限循环。
+这个 bug 是主机侧测试抓出来的（见第五节）。
 
-```python
-# ① 像素 -> 机械臂基座坐标（一次性线性标定）
-robot_x = 0.0008*object_y + 0.2563
-robot_y = -0.0010*object_x + 0.1450
-
-# ② 越界保护
-if robot_x < 1000 and robot_y < 1000: ...
-
-# ③ 抓取 -> 码垛（同一 XY 上按 55mm 一层往上叠）
-arm.cartesian_space_interpolated_motion(robot_x, robot_y, 0.30, 0)   # 抬高
-arm.cartesian_space_interpolated_motion(robot_x, robot_y, 0.21, 0)   # 下降
-arm.cartesian_space_interpolated_motion(robot_x, robot_y, 0.30, 0)   # 抬起（吸住了）
-arm.cartesian_space_interpolated_motion(0.052, 0.24, 0.21+0.055*i+0.05, 0)  # 移到码垛位上方
-arm.cartesian_space_interpolated_motion(0.052, 0.24, 0.21+0.055*i, 0)       # 下降
-gripper.off()                                                        # 放气
-```
-
-稳定判据在视觉侧：
-
-```python
-ThetaList[i] = Theta1
-count = ThetaList[ThetaList == Theta1].size
-if count == 2:      # 同一个角度出现两次就认为稳定
-    ...开始抓
-```
-
----
-
-## 二、搬到本项目后必须改的六处
-
-### 1. 像素→世界坐标：线性标定 → 完整投影链路
-
-**demo 的做法在车载相机上直接失效。** 那两行线性系数隐含了一个前提：
-相机不动、工作平面固定。车一动，同一个像素对应完全不同的世界坐标，
-而线性映射会给出一个"看起来合理"的错值 —— 最危险的那种错。
-
-本项目走完整链路（`ground_projection.cpp`）：
-
-```
-像素 (u,v)
-  → 去畸变（Brown 径向）
-  → 归一化射线 d_cam = K⁻¹[u,v,1]
-  → 由 TF 提供的 T_oc 旋转到 odom 系
-  → 与地面 z=0 求交
-  → 叠加一个 2D 仿射残差（吃掉装配公差）
-```
-
-`T_oc` 用**图像时间戳**去 TF 里查历史值。这一点很关键：驱动板在收到相机
-SYNC 上升沿的那一刻锁存了四轮位姿（见 `docs/01_architecture.md` 3.3 节），
-用同一时刻的位姿才不会把图像和位姿错开一个里程计周期。
-
-残差标定只需 3 个点，但有个陷阱：**标定点必须铺开**。三个点挤在一起时
-设计矩阵近乎共线，正规方程会把条件数平方，解出的矩阵线性部分乱飞、
-靠平移去凑 —— 在标定点附近误差很小，出了那个小区就完全不可用，而它
-看起来"标定成功了"。所以 `GroundProjection` 里有一道 `kMinCalibSpread = 8cm`
-的安全阀，跨度不够就退化成只校正平移，并在服务返回的 message 里明确
-告诉操作员。这条是写测试时才发现的（见第五节）。
-
-### 2. 稳定判据：按图像角度匹配 → 按地面坐标做数据关联
-
-demo 的 `ThetaList` 判据有两个问题：
-
-- 它按**角度值**匹配。方块的对称性让它只有两个可能的角度值，
-  两个不同位置的方块很容易被判成同一个。
-- 相机一动，同一个静止物块的像素坐标连续两帧完全不同，
-  任何基于像素量的匹配都会失败。
-
-改成 `block_tracker.cpp`：每帧的观测先投到 odom 系，用**最近邻 + 门限**
-（默认 60mm）做数据关联，再累计连续命中帧数。门限的取值有依据：
-车最快 0.85 m/s、控制周期 20ms 时位移 17mm，加上投影噪声与里程计漂移，
-60mm 有足够余量，又小于物块尺寸（80mm）不会串到隔壁物块。
-
-### 3. "抓取"的判定：定时 → 压力反馈
-
-demo 里 `gripper.on()` 之后直接按固定时长往下走 —— 压在物块边缘吸空了
-也会一路搬到码垛位，然后在放气的瞬间发现手里什么都没。
-
-本项目的驱动板有压力传感器，所以 `GRASP` 状态是**等压力达标**
-（`|压力| ≥ vacuum_threshold_kpa`），并且 `LIFT` 阶段再确认一次。
-搬运途中压力掉到阈值一半以下就判为掉件，放弃当前物块重新扫描。
-
-另外把单次吸空的重试路径设计成"回 ALIGN 重新对位再试"而不是原地再抽一次 ——
-吸不住通常是吸盘没压正，重新对位的成功率明显更高。
-
-### 4. 执行器的对应关系
-
-| demo | 本项目 |
-|---|---|
-| `vgripper.on()` / `.off()`（`PwmDriver` 控制气泵） | `/hw/set_pump`，`PumpCommand.cmd = RUN/STOP` |
-| `arm.cartesian_space_interpolated_motion(x,y,z)` | `/cmd_vel` 速度控制 + 位姿控制器 |
-| `arm.joint_space_interpolated_motion(...)` | 同上 |
-| `arm.home(n)` | `StartTask.return_home_after` / `AbortTask.return_home` |
-| `arm.init()` / `arm.enable()` / `arm.disable()` | `/hw/motor_commands` 的 enable 位 |
-| `arm.get_joints_poses()` | `/hw/motor_states` |
-
-气泵既可以给固定占空比（`MODE_OPEN_DUTY`），也可以让驱动板用压力环
-维持真空（`MODE_PRESSURE` + `vacuum_target_kpa`）。后者更省电：漏气时
-驱动板自动加大功率，上位机只需要看压力是否达标。
-
-### 5. 码垛 → 排放阵列
-
-demo 在同一个 XY 上按 55mm 一层往上叠。本项目是**地面移动平台，没有 Z 轴**，
-无法叠高，因此改成沿投放区铺开的一维/二维阵列：
-
-```yaml
-place:
-  x: 0.00
-  y: 1.20
-  yaw: 1.5707963
-  pitch: 0.12        # 物块 80mm + 30mm 取放余量
-  columns: 4         # 每行 4 个，超出自动换行
-  row_pitch: 0.12
-```
-
-这不是"简化"，是因为执行器物理能力不同。要叠高必须给车加一个升降机构。
-
-### 6. 定点停靠：三环插补 → 两段式位姿控制器
-
-demo 用 `cartesian_space_interpolated_motion(..., duration=5)` —— 机械臂
-有精确的运动学模型，给定时间插补就能到位。
-
-滑移转向底盘没有横向自由度，而且轮子会打滑，不能这么干。
-`drive_to_pose()` 用两段式：
-
-```
-第一段（位置没到）:
-    朝向 = atan2(目标 - 当前位置)          ← 注意是"指向目标"，不是期望朝向
-    |朝向误差| > 0.6 rad → 原地转
-    否则 v = kp·d·cos(e_h)，ω = kω·e_h
-第二段（位置到了）:
-    原地转到期望朝向
-```
-
-**为什么不能按期望朝向分解误差**：差速底盘唯一的横向纠偏手段就是转向。
-如果按期望朝向分解（`ex` 沿期望朝向、`ey` 垂直期望朝向），当车已经走到
-目标的同一纵坐标、只剩横向偏差时 `ex ≈ 0 → v ≈ 0`，而横向修正项是
-`ky·ey·v_norm`，`v_norm = 0` 让它整个消失 —— 车就停在离目标 20cm 的地方
-再也不动。这不是理论担忧，是第一次跑测试时实测到的（见第五节）。
-
----
-
-## 三、状态机
-
-```
-IDLE ─start─► SCAN ─找到目标─► APPROACH ─进入精定位区─► ALIGN ─对准─► SETTLE
-               ▲                                                   │
-               │                                                DESCEND
-               │                                                   │
-               │                                                 GRASP
-               │                                       ┌───────────┴───────────┐
-               │                                    压力达标              超时/重试耗尽
-               │                                       │                       │
-               │                                     LIFT                   跳过该物块
-               │                                       │                       │
-               │                                     HAUL ◄────────────────────┘
-               │                                       │
-               │                                     PLACE ─对准完成─► RELEASE
-               │                                       ▲                   │
-               └──────── RETREAT ◄─────────────────────┘                RETREAT
-                     (还有配额)                                            │
-                                                                      (配额完成) DONE
-```
-
-每个状态的超时、重试上限、以及超时后的去向都在 `config/task.yaml` 里，
-每条注释都写了数字的来源。
-
-### 三个容易写错的地方
-
-**① 重试计数必须按阶段独立。** 这版踩过坑：GRASP 失败后的重试路径是
-`GRASP → ALIGN → SETTLE → DESCEND → GRASP`，而 ALIGN 成功时会清零重试
-计数 —— 于是 `max_grasp_retry` 永远达不到，吸不住的物块会让状态机在
-这几个状态之间无限循环（实测跑满 8000 步 160 秒都没出来）。现在四个阶段
-各自有计数器（`scan_fail_` / `approach_fail_` / `align_fail_` / `grasp_fail_`）。
-
-**② `aborted` 标志必须挂在返回的那个对象上。** 曾经的写法是
-```cpp
-a.aborted = true;
-return stop_all("...");   // stop_all 新建了一个对象，aborted 丢了
-```
-结果是状态进了 `FAILED` 但上层收不到 `aborted`，以为任务还在跑。
-同样的坑在掉件路径里也有一份。
-
-**③ 中止+回起点不能退化成"回起点后继续干活"。** `abort(return_home=true)`
-借用 `RETREAT` 状态做回程，但 `RETREAT` 原本的职责是"退开后找下一个物块"。
-如果不加 `aborting_` 标志，操作员按下急停之后车会回到起点然后**接着扫描物块**。
-
-### 失败处理策略
-
-| 情况 | 处理 |
-|---|---|
-| 扫描超时 | 重试 `max_scan_retry` 轮；配额没完成且排除列表非空时，清空排除列表**补扫一轮**（只补一轮，避免死循环） |
-| 接近/精定位超时 | 跳过该物块，去找别的 |
-| 吸不住 | 回 ALIGN 重新对位重试 `max_grasp_retry` 次；仍不行则跳过 |
-| 搬运途中掉件 | 放弃当前物块并计入跳过，回 SCAN |
-| 连续跳过 5 个 | 判定 FAILED（气路或吸盘有问题，再试也没用） |
-| 底盘故障 / 急停 | 立刻 FAILED，释放负载，停所有执行器 |
-
----
-
-## 四、接口一览
-
-### 话题
+## 四、接口
 
 | 话题 | 类型 | 方向 |
 |---|---|---|
-| `/detected_blocks` | `hw_msgs/DetectedBlockArray` | block_detector → task_executor |
-| `/grasp_targets` | `geometry_msgs/PoseArray` | 发布（RViz 可视化，能看到每个物块的位置与角度） |
-| `/task_status` | `hw_msgs/TaskStatus` | 发布，20 Hz |
-| `/cmd_vel` | `geometry_msgs/Twist` | 发布 |
-| `/hw/pump_command` | `hw_msgs/PumpCommand` | 发布 |
-
-### 服务
+| `/arm/target_pose` | `hw_msgs/ArmTarget` | 发布（只在目标变化时） |
+| `/hw/pump_command` | `hw_msgs/PumpCommand` | 发布（只在开关状态变化时） |
+| `/detected_blocks` | `hw_msgs/DetectedBlockArray` | 订阅 |
+| `/arm/status` | `hw_msgs/ArmStatus` | 订阅（末端实测位姿、速度、ik_ok） |
+| `/hw/camera_sync` | `hw_msgs/CameraSync` | 订阅 |
+| `/hw/pump_state` | `hw_msgs/PumpState` | 订阅 |
+| `/hw/board_state` | `hw_msgs/BoardState` | 订阅 |
+| `/task_status` | `hw_msgs/TaskStatus` | 发布 |
+| `/grasp_targets` | `geometry_msgs/PoseArray` | 发布（RViz 显示） |
 
 | 服务 | 说明 |
 |---|---|
-| `/task/start` | 启动任务（可指定最多几个、颜色顺序、是否要求稳定） |
-| `/task/abort` | 中止（可指定就地释放 / 保持吸附、是否回起点） |
-| `/task/pause` | 暂停（可恢复，恢复时会扣掉暂停时长） |
-| `/task/resume` | 恢复 |
-| `/task/calibrate_mapping` | 采集一个标定点，校正投影残差 |
+| `/task/start` | `StartTask`：max_blocks、color_order、require_stable、return_home_after |
+| `/task/abort` | `AbortTask`：是否就地放气、是否回原点 |
+| `/task/pause` / `/task/resume` | 暂停/恢复（恢复时把暂停时长从计时器里扣掉，否则立刻超时） |
+| `/task/calibrate_mapping` | 手眼残差标定：给一个（像素, 台面坐标）对，累积解 2D 仿射 |
 
-### 典型操作序列
+`task_executor_node.cpp` 刻意只做"翻译"，不含任何决策逻辑 —— 所有 if/else 都在
+`task_sequencer.cpp` 里。这样现场改流程只动一个文件，改完先在 PC 上跑回归再上机。
 
-```bash
-# 1. 硬件层
-ros2 launch hw_bringup bringup.launch.py use_teleop:=false use_rviz:=true
+## 五、测试：控制器和仿真在同一个闭环里
 
-# 2. 任务层（或直接用 bringup 的 use_task:=true 一并拉起）
-ros2 launch hw_task task.launch.py
+`ros2_ws/src/hw_task/test/run_host_test.sh`（不需要 ROS、不需要 Eigen）。
 
-# 3. 确认视觉在跑
-ros2 topic hz /detected_blocks          # 应等于相机帧率
+关键设计：**仿真器直接调用 `arm_control` 的 D-H 正逆解**，而不是另写一套
+简化运动学。状态机下达末端位姿，仿真器用同一份逆解变成关节角、按关节限速
+走过去，再用正解算"实测"末端位姿回喂 —— 闭环里没有第二套运动学，所以
+"D-H 表改了但测试还过"这种假绿不会出现。这就是简历里说的虚实联调。
 
-# 4. 确认投影对不对（在 RViz 里看 /grasp_targets 的箭头是否落在物块上）
-ros2 topic echo /grasp_targets --once
-#   整体固定偏移   -> 用 calibrate_mapping 校正
-#   误差随距离变化 -> 相机内参错了，重新标定
+57 项检查覆盖：
 
-# 5. 标定投影残差（把物块放在一个量得准的位置，记下它的像素坐标）
-ros2 service call /task/calibrate_mapping hw_msgs/srv/CalibrateMapping \
-  "{block_color: 1, pixel_x: 318.0, pixel_y: 356.0, world_x: 0.0, world_y: 0.45}"
-
-# 6. 开跑
-ros2 service call /task/start hw_msgs/srv/StartTask \
-  "{max_blocks: 5, require_stable: true, return_home_after: true}"
-
-# 7. 看状态
-ros2 topic echo /task_status
-
-# 8. 出问题就中止
-ros2 service call /task/abort hw_msgs/srv/AbortTask \
-  "{release_payload: true, return_home: true}"
-```
-
----
-
-## 五、测试
-
-`test/test_sequencer.cpp` —— 73 项检查，全部通过。假的是传感器与底盘，
-状态机跑的是与真车完全相同的那份代码。
-
-```bash
-# 目标机上（用真正的 Eigen3）
-colcon build --packages-select hw_task
-colcon test --packages-select hw_task && colcon test-result --verbose
-
-# 没有 ROS 的开发机上（用自带的极简 Eigen 垫片）
-ros2_ws/src/hw_task/test/run_host_test.sh
-```
-
-### 覆盖的场景
-
-| 用例 | 内容 |
-|---|---|
-| A | 地面投影对照**解析解**（相机正对下方时有闭式解可比）；投影残差标定；标定点太集中时的降级 |
-| B | 多帧跟踪：连续帧数阈值、抖动不新建轨迹、远离新建轨迹、丢失后删除、颜色优先+距离排序、可抓范围筛选 |
-| C | 完整取放流程（正前方物块），检查终态、放置数、结束位姿 |
-| D | 侧前方物块（29° 方位角，考验转向收敛） |
-| E | 吸不住 → 重试 → 跳过 → 不卡死 |
-| F | 急停中断 |
-| G | 中止并返回起点 |
-| H | 搬运途中掉件 |
-| I | 暂停与恢复（计时补偿） |
+- 工作台投影：像素↔台面解析往返、相机外参必须是合法旋转（行列式 +1）、
+  标定点铺开时解出完整 2D 仿射、点太集中时退化为只解平移
+- 数据关联：面积过滤、稳定帧数、工作环带内外排除、颜色优先排序
+- 完整取放流程（单块）
+- 吸不住 → 跳过 → 连续失败 → aborted 上报
+- 急停、中止+回原点（中止后不得继续干活）
+- 搬运途中掉件
+- 暂停/恢复（计时补偿）
+- 不可达目标
+- 码垛（层号确实递增，不是平铺）
+- 视觉持续丢失、±1.2mm 视觉噪声下的鲁棒性
 
 ### 这一轮测试实际抓出来的问题
 
-写完之后跑第一遍就失败了 17 项，其中**五个是代码的真缺陷**：
+1. **掉件模型不锁存**：一开始"漏气"只在末端高于阈值时生效，末端一降回
+   物块上压力又恢复 —— 仿真变成了"掉了又自己吸回来"，掉件处理根本测不到。
+   改成密封破坏后锁存。
+2. **码垛层号差一**：`place_layer` 在 `placed_slots_` 自增之后又用它取模，
+   第一个物块被报成"第 1 层"，而它其实在最底下（第 0 层）。
+3. **相机外参不是合法旋转**：测试里的外参写成了 `diag(1,1,-1)`，行列式 -1，
+   是镜像不是旋转。自己生成像素、自己投影，往返照样对得上、测试照样全绿 ——
+   但 ROS 的 TF 必须来自四元数，表达不出这种矩阵，换真相机时整套投影会
+   静默地左右镜像。改成绕 x 轴转 180°（`diag(1,-1,-1)`）。
 
-1. **位姿控制器死锁**（最严重）。横向偏差大、纵向偏差小时，
-   `v → 0` 让横向修正项消失，车停在离目标 20cm 处不动。
-   实测表现：投放位对不准（x 偏 18.8cm）、侧前方物块永远进不了 ALIGN。
-2. **重试计数被跨阶段清零**，`max_grasp_retry` 永远触发不了，
-   吸不住的物块让状态机无限循环。
-3. **`aborted` 标志被覆盖**（`stop_all()` 新建对象），
-   状态进了 FAILED 但上层不知道。
-4. **中止回起点会退化成继续干活**（缺 `aborting_` 标志）。
-5. **暂停恢复的计时补偿是死代码**：先 `t_state_ = s.t` 再
-   `t_task_ += (s.t - t_state_)`，括号里恒为 0。
+## 六、参数
 
-另外两个是真实存在的**工程风险**，测试把它们逼出来了：
-
-6. **标定点太集中时 2D 仿射是病态问题**。三个点挤在 2.5cm 范围内时，
-   解出的矩阵线性部分乱飞、靠平移去凑 —— 标定点附近很准，出了那个
-   小区就完全失效，而它看起来"标定成功了"。加了 `kMinCalibSpread` 安全阀。
-7. **HAUL 到位判据缺角速度条件**，车在原地转着恰好扫过目标朝向的瞬间
-   会被误判为到达。
-
-剩下 10 项失败是测试自己写错了（观测没给面积被滤掉、三个标定点配了同一个
-世界坐标、理想投影用了带残差的 `project()` 导致偏移翻倍、推演步数选得太长
-跑过了想测的状态）。这些也都记在代码注释里了 —— 下次改这块的人能少踩一遍。
-
----
-
-## 六、还没做的
-
-- **`block_detector` 只做了颜色 + `minAreaRect`**，没有用 demo 里
-  `calculate_angles.py` 的 Canny + HoughLinesP 那条路。原因是两条路都在
-  求同一个"物块边缘角度"，而 `minAreaRect` 对矩形物块更稳（HoughLines
-  在有纹理的地面上会检出一堆杂线）。如果物块换成非矩形或者表面有花纹，
-  需要把 Hough 那条路加回来做交叉验证。
-- **没有做视觉伺服的最后一段**。现在是"投影出目标位置 → 位姿控制器开过去"，
-  没有用图像特征做闭环微调。滑移转向的停位精度实测在 2~3cm 量级，
-  如果物块更小或者场地更滑，需要在 ALIGN 阶段加一层基于图像的伺服。
-- **颜色顺序只在任务启动时指定**，中途不能改。
-- **没有多车协同 / 与上层导航栈的交接**。`HAUL` 阶段是自己走的直线位姿控制，
-  场地里有障碍物的话需要换成 nav2 的 NavigateToPose。
-- **掉件之后的物块位置没有重建**。物块掉在路上，代码只记一笔跳过，
-  不会去把掉在路上的物块捡起来（它可能滚到了别处）。
+全部在 `ros2_ws/src/hw_task/config/task.yaml`，每个数字都注明了来源。
+改之前先看注释 —— 尤其是 `touch_z` 的 2mm 过盈量（Z 轴是开环丝杠传动）
+和 `place.layer_height`（必须填实测物块高度，不是标称值）。

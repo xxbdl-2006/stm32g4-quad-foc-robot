@@ -35,7 +35,7 @@ def generate_launch_description():
     controllers_yaml = LaunchConfiguration('controllers')
 
     robot_description = Command([
-        'xacro ', PathJoinSubstitution([pkg_bringup, 'urdf', 'hwb_robot.urdf.xacro']),
+        'xacro ', PathJoinSubstitution([pkg_bringup, 'urdf', 'hwb_arm4.urdf.xacro']),
         ' can_interface:=', can_interface,
         ' use_ros2_control:=true',
     ])
@@ -66,20 +66,20 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('start_controllers')),
     )
 
-    diff_drive_controller = Node(
+    arm_joint_trajectory_controller = Node(
         package='controller_manager',
         executable='spawner',
-        arguments=['diff_drive_controller', '--controller-manager', '/controller_manager'],
+        arguments=['arm_joint_trajectory_controller', '--controller-manager', '/controller_manager'],
         output='screen',
         condition=IfCondition(LaunchConfiguration('start_controllers')),
     )
 
     # 顺序很重要：broadcaster 必须先起来，否则 controller_manager 会因为
-    # 拿不到 joint_states 而拒绝加载 diff_drive_controller。
+    # 拿不到 joint_states 而拒绝加载轨迹控制器。
     load_drive_after_broadcaster = RegisterEventHandler(
         OnProcessExit(
             target_action=joint_state_broadcaster,
-            on_exit=[diff_drive_controller],
+            on_exit=[arm_joint_trajectory_controller],
         )
     )
 

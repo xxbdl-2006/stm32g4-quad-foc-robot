@@ -20,27 +20,30 @@ find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Eigen3 REQUIRED)
+# 运动学的唯一来源：状态机下达的是末端位姿，要先把"这个位姿可不可达"算出来。
+# 测试里也用同一份源码，所以不能是可选依赖。
+find_package(arm_control REQUIRED)
 
 # ---------------------------------------------------------------------------
 #  纯逻辑核心库
 #
 #  这一层**刻意不链接 rclcpp**。三个文件放在一起是因为它们共同构成
 #  "把像素变成抓取动作"的全部决策逻辑，而它们都可以脱离 ROS 单独测试：
-#      task_sequencer   状态机
-#      block_tracker    多帧关联与目标排序
-#      ground_projection 像素 -> 地面坐标
+#      task_sequencer    状态机（输出的是末端目标位姿）
+#      block_tracker     多帧关联与目标排序
+#      table_projection  像素 -> 工作台面坐标
 #  节点只负责把传感器数据喂进来、把动作发出去（见 task_executor_node.cpp）。
 # ---------------------------------------------------------------------------
 add_library(hw_task_core STATIC
   src/task_sequencer.cpp
   src/block_tracker.cpp
-  src/ground_projection.cpp
+  src/table_projection.cpp
 )
 target_include_directories(hw_task_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(hw_task_core PUBLIC Eigen3::Eigen)
+target_link_libraries(hw_task_core PUBLIC Eigen3::Eigen arm_control::arm_control_core)
 
 # ---------------------------------------------------------------------------
 #  任务执行节点
@@ -90,24 +93,23 @@ ament_export_targets(export_${PROJECT_NAME})
 # ---------------------------------------------------------------------------
 #  纯逻辑测试
 #
-#  用系统 Eigen 编译（目标机上一定有），跑的是与真车完全相同的那份状态机代码，
-#  假的只是传感器和底盘运动学。
+#  用系统 Eigen 编译（目标机上一定有），跑的是与真机完全相同的那份状态机代码，
+#  假的只有传感器、气泵与机械臂的关节伺服（机械臂的**运动学是真的** ——
+#  仿真器直接调用 arm_control 的 D-H 正逆解，见 test/test_sequencer.cpp）。
 #
-#  没装 ROS 的开发机上想单独跑，可以手工编译（详见 test/test_sequencer.cpp 头部）：
-#      g++ -std=c++17 -I include -I test/host_shim test/test_sequencer.cpp \
-#          src/task_sequencer.cpp src/block_tracker.cpp src/ground_projection.cpp -o /tmp/t
-#  这时会用到 test/host_shim 下的极简 Eigen 垫片（只为不依赖 Eigen3 而存在）。
-#  两条路径共用同一份测试源码。
+#  没装 ROS 的开发机上想单独跑，直接执行 test/run_host_test.sh：
+#  它会用 test/host_shim 下的极简 Eigen 垫片代替 Eigen3，
+#  并一并编译 arm_control 的运动学源码。两条路径共用同一份测试源码。
 # ---------------------------------------------------------------------------
 if(BUILD_TESTING)
   add_executable(task_sequencer_test
     test/test_sequencer.cpp
     src/task_sequencer.cpp
     src/block_tracker.cpp
-    src/ground_projection.cpp
+    src/table_projection.cpp
   )
   target_include_directories(task_sequencer_test PRIVATE include)
-  target_link_libraries(task_sequencer_test PRIVATE Eigen3::Eigen)
+  target_link_libraries(task_sequencer_test PRIVATE Eigen3::Eigen arm_control::arm_control_core)
 
   ament_add_test(
     task_sequencer_logic

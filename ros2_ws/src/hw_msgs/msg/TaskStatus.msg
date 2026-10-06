@@ -5,14 +5,14 @@ std_msgs/Header header
 # ---- 状态机 ----
 uint8 STATE_IDLE     = 0    # 未启动
 uint8 STATE_SCAN     = 1    # 扫描寻找物块
-uint8 STATE_APPROACH = 2    # 粗定位：开到物块附近
-uint8 STATE_ALIGN    = 3    # 精定位：视觉伺服对准
+uint8 STATE_APPROACH = 2    # 粗定位：末端移动到物块上方（允许绕行）
+uint8 STATE_ALIGN    = 3    # 精定位：用最新视觉结果刷新目标，直到残差收敛
 uint8 STATE_SETTLE   = 4    # 停稳等待
-uint8 STATE_DESCEND  = 5    # 建立负压（气泵抽真空）
-uint8 STATE_GRASP    = 6    # 判定吸住
-uint8 STATE_LIFT     = 7    # 确认离地
-uint8 STATE_HAUL     = 8    # 运送到投放区
-uint8 STATE_PLACE    = 9    # 对准投放位
+uint8 STATE_DESCEND  = 5    # 直线下压到物块顶面
+uint8 STATE_GRASP    = 6    # 建立负压并判定吸住
+uint8 STATE_LIFT     = 7    # 抬到搬运高度
+uint8 STATE_HAUL     = 8    # 在搬运高度平移到投放位上方
+uint8 STATE_PLACE    = 9    # 下放到投放面（或码垛的下一层）
 uint8 STATE_RELEASE  = 10   # 放气释放
 uint8 STATE_RETREAT  = 11   # 退开
 uint8 STATE_DONE     = 12   # 全部完成
@@ -32,6 +32,7 @@ float32 elapsed                # 本次任务已运行时间（s）
 # ---- 现场信息（比赛时界面直接显示这些）----
 string  message                # 人类可读的一行说明
 float32 pump_pressure          # kPa
-float32 target_distance        # 到当前目标的距离（m），-1 表示无目标
-float32 pose_confidence        # 基于 camera_sync 的对齐置信度 0..1
+float32 target_range           # 当前物块到基座回转轴的距离（m），-1 表示无目标
+float32 pose_confidence        # 基于相机同步与目标可见性的置信度 0..1
 bool    vision_ok
+uint8   place_layer            # 当前码垛层号（0 起）。Array 模式下恒为 0

@@ -16,6 +16,8 @@ uint8 color
 float32 pixel_x                # 像素坐标 u（原始图像，未裁剪）
 float32 pixel_y                # 像素坐标 v
 float32 yaw                    # rad，物块绕垂直轴的偏转角，已归一到 [-pi/2, pi/2)
+                               # 注：本机构用圆形真空吸盘，抓取不需要物块朝向；
+                               # 这个字段只用于显示与标定时的人工核对
 float32 area                   # 像素面积，用于尺度/有效性判据
 float32 confidence             # 0..1，连续帧一致度（0 表示只出现过一次）
 uint32  stable_frames          # 连续被判为同一物块的帧数

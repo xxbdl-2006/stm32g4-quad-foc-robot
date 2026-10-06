@@ -3,7 +3,7 @@
 //
 //  为什么会有这个文件
 //  ------------------
-//  hw_task 的三个核心文件（ground_projection / block_tracker / task_sequencer）
+//  hw_task 的两个核心文件（table_projection / block_tracker）
 //  刻意不依赖 rclcpp，就是为了能在没有 ROS 的机器上单独跑状态机验证。
 //  但它们用了 Eigen 的向量/矩阵（目标机上由 Eigen3 提供）。
 //  这个垫片只实现实际用到的那几个操作，让测试在没有 Eigen 的开发机上也能跑。

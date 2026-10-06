@@ -1,148 +1,123 @@
 // ============================================================================
 //  test_sequencer.cpp
-//  hw_task 纯逻辑层的主机侧验证。不依赖 ROS、不依赖 Eigen（用自带的垫片）。
+//  hw_task 纯逻辑层的主机侧回归测试。
 //
-//  跑法（在装了 ROS 的目标机上）：
-//      colcon test --packages-select hw_task
-//  跑法（没有 ROS 的开发机上，直接编译）：
-//      g++ -std=c++17 -I include -I test/host_shim
-//          test/test_sequencer.cpp src/task_sequencer.cpp
-//          src/block_tracker.cpp src/ground_projection.cpp -o /tmp/t && /tmp/t
+//  编译运行（不需要 ROS）：
+//      test/run_host_test.sh
 //
-//  为什么值得写这个
-//  --------------
-//  比赛现场最贵的成本是时间。状态机里"某个状态超时后没清标志，于是任务卡死"
-//  这类问题，在真车上复现一次要几分钟，而在仿真里只要毫秒。这里把状态机
-//  接一个运动学积分器和假的传感器，就能在 PC 上把完整流程跑几百遍。
+//  这个测试用 **arm_control 的真实运动学** 做仿真：状态机下达的是末端目标位姿，
+//  仿真器用同一份 D-H 表与闭式逆解把它变成关节角，再按关节限速走过去，
+//  然后用正解算出"实测"末端位姿回喂给状态机。
+//  也就是简历里说的"虚实联调" —— 控制器和仿真在同一个闭环里，而不是各写一套。
 //
-//  注意：这里假的是**传感器与底盘**，状态机本身跑的是与真车完全相同的那份代码。
+//  真机上一次完整取放要几十秒，失败了很难复现；这里可以把全部状态、
+//  全部失败分支跑几百遍。真机上还要核对的是：D-H 表的长度、关节零位、
+//  丝杠导程、相机内参与安装位姿。
 // ============================================================================
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
 
+#include <Eigen/Core>
+
+#include "arm_control/arm_model.hpp"
+#include "arm_control/dh.hpp"
+#include "arm_control/scara_ik.hpp"
+#include "arm_control/trajectory.hpp"
+
 #include "hw_task/block_tracker.hpp"
-#include "hw_task/ground_projection.hpp"
+#include "hw_task/table_projection.hpp"
 #include "hw_task/task_sequencer.hpp"
+
+// 运动学的关节索引常量在 arm_control 命名空间里；仿真器里用得频繁，
+// 逐个限定会淹没断言本身的可读性。
+using arm_control::kJ1Base;
+using arm_control::kJ2Shoulder;
+using arm_control::kJ3Elbow;
+using arm_control::kJ4Lift;
+using arm_control::kJointCount;
 
 namespace
 {
 
-int g_failures = 0;
-int g_checks = 0;
+int g_pass = 0;
+int g_fail = 0;
+const char * g_section = "";
+
+void section(const char * s)
+{
+  g_section = s;
+  std::printf("\n=== %s ===\n", s);
+}
 
 void check(bool cond, const std::string & what)
 {
-  ++g_checks;
-  if (!cond) {
-    ++g_failures;
-    std::printf("  \033[31m[FAIL]\033[0m %s\n", what.c_str());
+  if (cond) {
+    ++g_pass;
+    std::printf("  [ok]   %s\n", what.c_str());
+  } else {
+    ++g_fail;
+    std::printf("  [FAIL] %s   (%s)\n", what.c_str(), g_section);
   }
 }
 
-void check_near(double a, double b, double tol, const std::string & what)
+void check_near(double got, double want, double tol, const std::string & what)
 {
-  ++g_checks;
-  if (!(std::fabs(a - b) <= tol)) {
-    ++g_failures;
-    std::printf("  \033[31m[FAIL]\033[0m %s：得到 %.6f，期望 %.6f（容差 %.6f，差 %.6f）\n",
-                what.c_str(), a, b, tol, std::fabs(a - b));
+  const bool ok = std::fabs(got - want) <= tol;
+  if (ok) {
+    ++g_pass;
+    std::printf("  [ok]   %s (%.6g)\n", what.c_str(), got);
+  } else {
+    ++g_fail;
+    std::printf("  [FAIL] %s  期望 %.6g 实际 %.6g 差 %.3g  (%s)\n",
+                what.c_str(), want, got, std::fabs(got - want), g_section);
   }
 }
 
-void section(const char * name)
+// ===========================================================================
+//  相机模型（理想针孔 + 固定安装在工作台上方）
+//
+//  相机在基座系 (0, 0.50, cam_h) 处垂直向下看。图像 x 向右 = 基座 +x。
+//
+//  图像 y 的方向必须想清楚：相机光学系是右手系（z 沿光轴向前），而光轴朝下，
+//  也就是 z_cam = -z_base。若再要求 x_cam = +x_base，那么
+//      z_cam = x_cam × y_cam  ->  -z_base = x_base × y_cam  ->  y_cam = -y_base
+//  所以图像里"向下"对应基座的 **-y** 方向。写成矩阵是绕基座 x 轴转 180°：
+//      R = diag(1, -1, -1)     行列式 +1，是合法旋转
+//  这里有个很容易踩的坑：如果图省事把外参写成 diag(1, 1, -1)，行列式是 -1，
+//  它**不是旋转**，而是一个镜像。自己生成像素、自己投影，往返照样对得上，
+//  测试会全绿 —— 但 ROS 里的 TF 必须来自四元数，根本表达不出这种矩阵，
+//  换成真相机时整套投影会静默地左右镜像。
+//
+//  于是理想投影是解析的：
+//      u = cx + fx * x / cam_h
+//      v = cy - fy * (y - 0.50) / cam_h
+//  用这个模型生成像素、再用 TableProjection 投回去，可以完整验证
+//  "内参 + 外参 + 台面求交"这条链路 —— 而且不依赖任何标定数据。
+// ===========================================================================
+constexpr double kCamH = 0.600;      // 相机离台面 600mm，俯视整个工作区
+constexpr double kCamY = 0.500;      // 光轴在基座系 y 方向的偏移
+
+Eigen::Matrix4d camera_to_base()
 {
-  std::printf("\n\033[1m== %s ==\033[0m\n", name);
+  /* 相机光学系 -> 基座系：绕基座 x 轴转 180° 再平移。
+   *   基座 x =  相机 x
+   *   基座 y = -相机 y + 偏移
+   *   基座 z = -相机 z + cam_h
+   * 对应 URDF 里 camera_link 在 (0, 0.5, 0.6)、camera_optical_joint
+   * 的 rpy = (π, 0, 0)。 */
+  Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+  T(1, 1) = -1.0;
+  T(2, 2) = -1.0;
+  T(1, 3) = kCamY;
+  T(2, 3) = kCamH;
+  return T;
 }
 
-// ===========================================================================
-//  底盘运动学积分器（差速/滑移转向：只能前进后退 + 转向）
-// ===========================================================================
-struct VehicleSim
+hw_task::CameraIntrinsics make_intrinsics()
 {
-  double x{0.0}, y{0.0}, yaw{0.0};
-  double vx{0.0}, wz{0.0};
-  double t{0.0};
-
-  void step(double cmd_vx, double cmd_wz, double dt)
-  {
-    // 简单一阶响应：速度环是 1kHz 的，20ms 内基本到位，直接用命令值即可。
-    vx = cmd_vx;
-    wz = cmd_wz;
-    x += vx * std::cos(yaw) * dt;
-    y += vx * std::sin(yaw) * dt;
-    yaw += wz * dt;
-    t += dt;
-  }
-};
-
-struct FakeWorld
-{
-  // 物块（可多个）
-  struct Block
-  {
-    double x, y, yaw;
-    hw_task::BlockColor color;
-    bool on_vehicle{false};
-    bool removed{false};
-  };
-  std::vector<Block> blocks;
-
-  // 气泵
-  bool   pump_run{false};
-  double pump_duty{0.0};
-  double pressure{0.0};      ///< 表压 kPa
-  bool   vacuum_capable{true};  ///< false 模拟"吸盘漏气，永远吸不住"
-  bool   drop_after_grasp{false}; ///< true 模拟"吸起来又掉件"
-  bool   visible{true};
-
-  /// 气泵动力学：开泵后约 0.15s 建立真空
-  void pump_step(double dt)
-  {
-    const double target = pump_run ? (vacuum_capable ? -28.0 : -2.0) : 0.0;
-    const double tau = 0.05;
-    pressure += (target - pressure) * (dt / tau);
-    if (drop_after_grasp && pump_run) {
-      // 模拟搬运途中掉件：吸住之后压力突然消失
-      pressure += (0.0 - pressure) * (dt / tau) * 3.0;
-    }
-  }
-};
-
-/// 把世界状态打包成 SensorSnapshot
-hw_task::SensorSnapshot make_snapshot(const VehicleSim & v, const FakeWorld & w,
-                                      bool target_valid, const FakeWorld::Block * tgt)
-{
-  hw_task::SensorSnapshot s;
-  s.t = v.t;
-  s.vehicle_x = v.x;
-  s.vehicle_y = v.y;
-  s.vehicle_yaw = v.yaw;
-  s.vehicle_vx = v.vx;
-  s.vehicle_wz = v.wz;
-  s.vision_ok = w.visible;
-  s.blocks_visible = static_cast<uint32_t>(w.blocks.size());
-  s.pump_online = true;
-  s.pump_pressure_kpa = w.pressure;
-  s.target_valid = target_valid;
-  if (target_valid && tgt) {
-    s.target_x = tgt->x;
-    s.target_y = tgt->y;
-    s.target_yaw = tgt->yaw;
-    s.target_color = tgt->color;
-    s.target_confidence = 1.0f;
-  }
-  return s;
-}
-
-// ===========================================================================
-//  A. 地面投影的解析验证
-// ===========================================================================
-void test_ground_projection()
-{
-  section("A. 地面投影（对照解析解）");
-
   hw_task::CameraIntrinsics K;
   K.fx = 600.0;
   K.fy = 600.0;
@@ -150,701 +125,888 @@ void test_ground_projection()
   K.cy = 240.0;
   K.width = 640;
   K.height = 480;
+  K.k1 = 0.0;
+  K.k2 = 0.0;
+  return K;
+}
 
-  hw_task::GroundProjection gp;
-  gp.set_intrinsics(K);
+/// 世界坐标 -> 理想像素坐标
+void world_to_pixel(double x, double y, double * u, double * v)
+{
+  const hw_task::CameraIntrinsics K = make_intrinsics();
+  *u = K.cx + K.fx * x / kCamH;
+  *v = K.cy - K.fy * (y - kCamY) / kCamH;   // 注意负号，见上面的推导
+}
 
-  /* 构造一个"正对下方"的相机，这样有解析解可比：
-   * 相机光轴 z 指向世界 -z（正下方），绕世界 x 轴转 π 即可。
-   *   R = diag(1, -1, -1)   （绕 x 转 π）
-   *       cam x -> world  x
-   *       cam y -> world -y
-   *       cam z -> world -z   ← 朝下
-   * 相机装在 (0, 0.5, 0.3)。 */
-  Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
-  T(0, 0) = 1.0;
-  T(1, 1) = -1.0;
-  T(2, 2) = -1.0;
-  T(0, 3) = 0.0;
-  T(1, 3) = 0.5;
-  T(2, 3) = 0.3;
-
-  // ① 主点像素 -> 相机正下方的地面点
+// ===========================================================================
+//  机械臂仿真器：真实 D-H 正逆解 + 关节限速
+// ===========================================================================
+class ArmSim
+{
+public:
+  ArmSim()
   {
-    const auto p = gp.project(320.0, 240.0, T);
-    check(p.valid, "主点像素应该能投到地面");
-    check_near(p.x, 0.0, 1e-6, "主点投影 x");
-    check_near(p.y, 0.5, 1e-6, "主点投影 y");
-    check_near(p.range, 0.3, 1e-6, "主点投影距离应等于相机高度");
+    // 起始姿态取 home 位的逆解，避免"开机就停在工作区中间挡住相机"
+    arm_control::IkSolution sol;
+    if (arm_control::scara_inverse(geo_, lim_, 0.28, 0.0, 0.100, 0.0, nullptr, &sol)) {
+      for (int i = 0; i < kJointCount; ++i) { q_[i] = sol.q[i]; cmd_[i] = sol.q[i]; }
+    }
   }
 
-  // ② 像素右偏 fx（xd = 1）-> 地面点应偏离 0.3m
-  //    射线 (1,0,1)/√2 -> 世界 (1,0,-1)/√2；t = 0.3/(1/√2)；落点 x = 0.3
+  /// 接受状态机下达的新目标
+  void command(const hw_task::Actuation & a)
   {
-    const auto p = gp.project(320.0 + 600.0, 240.0, T);
-    check(p.valid, "右偏像素应能投到地面");
-    check_near(p.x, 0.3, 1e-6, "xd=1 时地面偏移量应等于相机高度");
-    check_near(p.y, 0.5, 1e-6, "该点 y 不应变化");
+    if (!a.set_pose) { return; }
+    arm_control::IkSolution sol;
+    if (!arm_control::scara_inverse(geo_, lim_, a.pose_x, a.pose_y, a.pose_z,
+                                    a.pose_yaw, q_, &sol)) {
+      /* 逆解失败 —— 真实系统里表现为 arm_control 拒绝目标并在 /arm/status
+       * 上置 ik_ok=false。仿真器把这件事记下来，由 sample() 传给状态机。 */
+      ik_failed_ = true;
+      ++rejected_goals_;
+      return;
+    }
+    ik_failed_ = false;
+    for (int i = 0; i < kJointCount; ++i) { cmd_[i] = sol.q[i]; }
   }
 
-  // ③ 像素下偏 fy（yd = 1）-> 世界 -y 方向 0.3m（因为 cam y 映射到 world -y）
+  /// 按关节限速把关节值推向目标
+  void step(double dt)
   {
-    const auto p = gp.project(320.0, 240.0 + 600.0, T);
-    check(p.valid, "下偏像素应能投到地面");
-    check_near(p.x, 0.0, 1e-6, "该点 x 不应变化");
-    check_near(p.y, 0.2, 1e-6, "yd=1 时地面偏移量应等于相机高度");
+    const arm_control::TrajectoryLimits tl;
+    for (int i = 0; i < kJointCount; ++i) {
+      /* 仿真里只用 60% 的关节限速。真实系统里 arm_control 走的是五次
+       * 多项式（起停处速度为零），不会一直贴着限速跑；用满限速会让
+       * 仿真比真实系统"灵活"，掩盖掉超时类的问题。 */
+      const double v = tl.vmax[i] * 0.6;
+      const double d = cmd_[i] - q_[i];
+      const double step_max = v * dt;
+      if (std::fabs(d) <= step_max) {
+        q_[i] = cmd_[i];
+      } else {
+        q_[i] += (d > 0.0 ? step_max : -step_max);
+      }
+    }
   }
 
-  // ④ 射线朝上（相机朝天）-> 必须判无效，不能返回一个荒唐的远点
+  /// 正解 + 有限差分求末端速度
+  void sample(double dt, hw_task::SensorSnapshot & s)
   {
-    Eigen::Matrix4d Tup = Eigen::Matrix4d::Identity();
-    Tup(0, 1) = 1.0;
-    Tup(1, 0) = 1.0;
-    Tup(0, 0) = 0.0;
-    Tup(1, 1) = 0.0;
-    // 上面构造的是绕 z 转 90°，光轴仍朝下；改成真的朝上：
-    Eigen::Matrix4d Tsky = Eigen::Matrix4d::Identity();
-    Tsky(2, 2) = 1.0;   // cam z -> world +z（朝上）
-    Tsky(2, 3) = 0.3;
-    const auto p = gp.project(320.0, 240.0, Tsky);
-    check(!p.valid, "射线朝上时必须判无效");
+    const arm_control::ToolPose p = arm_control::forward_tool_pose(geo_, q_);
+    if (have_prev_ && dt > 0.0) {
+      s.tool_vx = (p.x - prev_.x) / dt;
+      s.tool_vy = (p.y - prev_.y) / dt;
+      s.tool_vz = (p.z - prev_.z) / dt;
+    }
+    prev_ = p;
+    have_prev_ = true;
+    s.tool_x = p.x;
+    s.tool_y = p.y;
+    s.tool_z = p.z;
+    s.ik_ok = !ik_failed_;
   }
 
-  // 相机的解析理想投影（相机在 (0, 0.5, cam_h)、光轴朝下）
-  const double cam_h = 0.3;
-  auto ideal = [&](double u, double v) {
-      return Eigen::Vector2d((u - 320.0) / 600.0 * cam_h,
-                             0.5 - (v - 240.0) / 600.0 * cam_h);
-    };
+  uint32_t rejected_goals() const { return rejected_goals_; }
 
-  // ⑤ 残差校正：给一个已知的整体平移，看能不能吸收掉
+private:
+  arm_control::ArmGeometry geo_{};
+  arm_control::JointLimits lim_{};
+  double q_[kJointCount]{0.0, 0.0, 0.0, 0.0};
+  double cmd_[kJointCount]{0.0, 0.0, 0.0, 0.0};
+  arm_control::ToolPose prev_{};
+  bool   have_prev_{false};
+  bool   ik_failed_{false};
+  uint32_t rejected_goals_{0};
+};
+
+// ===========================================================================
+//  假世界：物块、气泵、真空压力
+// ===========================================================================
+struct FakeBlock
+{
+  double x{0.0};
+  double y{0.0};
+  double yaw{0.0};
+  hw_task::BlockColor color{hw_task::BlockColor::Red};
+  double area_px{5000.0};
+};
+
+class FakeWorld
+{
+public:
+  std::vector<FakeBlock> blocks;
+
+  // ---- 气泵 ----
+  bool   pump_dead{false};        ///< 泵坏了：抽不出真空（模拟吸不住）
+  double pressure{0.0};           ///< kPa，表压
+  double target_vacuum{-30.0};    ///< 泵能建立的最大真空度
+  double rise_tau{0.35};          ///< 抽气时间常数
+  double fall_tau{0.25};          ///< 泄气时间常数
+
+  /// 抬起超过 drop_trigger_z 就漏气（模拟吸盘在颠簸中泄压）
+  bool   drops_on_lift{false};
+  double drop_trigger_z{0.075};
+  /// 密封一旦破坏就锁存：真空再也建立不起来
+  bool   seal_broken{false};
+
+  /// 视觉位置噪声幅度（m）
+  double noise{0.0};
+
+  int attached{-1};               ///< 被吸住的物块下标
+
+  void apply(const hw_task::Actuation & a)
   {
-    hw_task::GroundProjection gp2;
-    gp2.set_intrinsics(K);
+    pump_on_ = a.pump_run && a.pump_duty > 0.001;
+  }
 
-    /* 三个标定点：像素 -> 真实世界。
-     * 真实世界坐标 = **解析**理想投影 + (ox, oy)，模拟"相机实际装歪了 2cm"。
-     *
-     * 理想投影自己算，不能拿 gp2.project() 去求 —— 因为 gp2 身上已经带着
-     * 前面标定点解出来的残差，第二次调用开始它的输出就是"已经校正过"的了，
-     * 再加一次偏移会变成 2*offset。第一版就是这么错的，结果校正后误差
-     * 反而翻倍，看着像投影算法有 bug。 */
-    const double ox = 0.02, oy = -0.015;
-    /* 标定点必须**铺开**。第一版用的是三个挨在一起的像素
-     * （(300,230)(350,250)(320,240)，地面跨度只有 2.5cm），
-     * 结果设计矩阵近乎共线，正规方程解出来的仿射矩阵线性部分乱飞，
-     * 靠平移去凑 —— 在标定点附近凑得很准，出了那个小区域就完全失效。
-     * 这正是 ground_projection.cpp 里 kMinCalibSpread 那道安全阀要拦的情况。
-     * 这里取覆盖整幅画面的三个点，地面跨度约 0.37m。 */
-    const double cal_px[3][2] = {{20.0, 20.0}, {620.0, 20.0}, {320.0, 460.0}};
+  void step(double dt, double tool_x, double tool_y, double tool_z)
+  {
+    /* 密封失效：抬起时如果吸盘漏气，就锁存"吸盘坏了"这个事实。
+     * 必须锁存而不是"只在高处漏"—— 否则末端一降回物块上，压力又恢复成
+     * 正常真空，仿真就变成了"掉了又自己吸回来"，测不出掉件处理逻辑。
+     * 现实里也确实如此：密封面一旦被破坏（吸进灰尘、物块表面不平），
+     * 在原位重新抽气通常也抽不起来了。 */
+    if (drops_on_lift && attached >= 0 && tool_z > drop_trigger_z) {
+      seal_broken = true;
+    }
+
+    // ---- 压力一阶动态 ----
+    const bool pumping = pump_on_ && !pump_dead && !seal_broken;
+    const double goal = pumping ? target_vacuum : 0.0;
+    const double tau = pumping ? rise_tau : 0.05;
+    pressure += (goal - pressure) * std::min(1.0, dt / tau);
+
+    // ---- 吸附判定 ----
+    const bool vacuum = std::fabs(pressure) > 5.0;
+    if (attached < 0) {
+      if (vacuum) {
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+          const double d = std::hypot(blocks[i].x - tool_x, blocks[i].y - tool_y);
+          // 吸盘中心与物块中心的偏差在 20mm 内才算吸上（圆吸盘的实际接触面）
+          if (d < 0.020) { attached = static_cast<int>(i); break; }
+        }
+      }
+    } else if (!vacuum) {
+      attached = -1;   // 泄气或漏气 -> 松脱，物块留在原地
+    }
+
+    // ---- 被吸住的物块跟着末端走 ----
+    if (attached >= 0) {
+      blocks[static_cast<std::size_t>(attached)].x = tool_x;
+      blocks[static_cast<std::size_t>(attached)].y = tool_y;
+    }
+  }
+
+  /// 生成一帧观测
+  std::vector<hw_task::BlockObservation> observe() const
+  {
+    std::vector<hw_task::BlockObservation> out;
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+      /* 被吸在吸盘上的物块不参与视觉：相机当然看得见它，但投影链路按
+       * "物块在台面上"求交，会给出一个完全错误的位置（它在空中）。
+       * 真实系统里这是个已知干扰源，处理办法是任务层在搬运阶段不重新挑
+       * 目标 —— 由 TaskSequencer 的状态机保证（只有 SCAN/APPROACH/ALIGN
+       * 会重新绑目标）。 */
+      if (static_cast<int>(i) == attached) { continue; }
+
+      const double dx = (noise > 0.0)
+        ? (noise * std::sin(static_cast<double>(i) * 7.3 + t_)) : 0.0;
+      const double dy = (noise > 0.0)
+        ? (noise * std::cos(static_cast<double>(i) * 3.1 + t_)) : 0.0;
+
+      hw_task::BlockObservation o;
+      o.pos = Eigen::Vector2d(blocks[i].x + dx, blocks[i].y + dy);
+      o.color = blocks[i].color;
+      o.yaw = blocks[i].yaw;
+      o.area_px = blocks[i].area_px;
+      o.confidence_px = 0.8;
+      double pu = 0.0, pv = 0.0;
+      world_to_pixel(blocks[i].x, blocks[i].y, &pu, &pv);
+      o.pixel_x = static_cast<float>(pu);
+      o.pixel_y = static_cast<float>(pv);
+      out.push_back(o);
+    }
+    return out;
+  }
+
+  void advance_time(double dt) { t_ += dt; }
+
+private:
+  bool   pump_on_{false};
+  double t_{0.0};
+};
+
+// ===========================================================================
+//  测试台：把状态机接上仿真器
+// ===========================================================================
+struct RunResult
+{
+  hw_task::TaskState final_state{hw_task::TaskState::Idle};
+  uint32_t placed{0};
+  uint32_t skipped{0};
+  int      steps{0};
+  bool     finished{false};
+  bool     aborted{false};
+  uint8_t  max_layer{0};
+  double   final_t{0.0};
+  std::string last_message;
+};
+
+struct Harness
+{
+  hw_task::TaskConfig    cfg;
+  hw_task::TaskSequencer seq;
+  hw_task::BlockTracker  tracker;
+  ArmSim    sim;
+  FakeWorld world;
+
+  double dt{0.02};                 ///< 50 Hz，与 task.yaml 的 control_rate_hz 一致
+
+  // ---- 可注入的故障 ----
+  bool vision_down{false};
+  bool arm_faulted{false};
+  bool estop{false};
+
+  Harness()
+  {
+    cfg.place_x = 0.28;
+    cfg.place_y = -0.14;
+    cfg.place_yaw = 0.0;
+
+    hw_task::TrackerConfig tc;
+    tc.match_radius = 0.040;
+    tc.min_stable_frames = cfg.min_stable_frames;
+    tracker.configure(tc);
+    seq.configure(cfg);
+  }
+
+  hw_task::SensorSnapshot snapshot(double t)
+  {
+    hw_task::SensorSnapshot s;
+    s.t = t;
+    sim.sample(dt, s);
+
+    s.vision_ok = vision_ok_;
+    s.blocks_visible = visible_;
+
+    s.pump_online = true;
+    s.pump_pressure_kpa = world.pressure;
+    s.pump_fault = 0;
+
+    s.arm_faulted = arm_faulted;
+    s.estop = estop;
+
+    if (have_bound_) {
+      s.target_valid = true;
+      s.target_x = bound_x;
+      s.target_y = bound_y;
+      s.target_yaw = bound_yaw;
+      s.target_color = bound_color;
+      s.target_confidence = bound_conf;
+    }
+    return s;
+  }
+
+  void feed_vision(double t)
+  {
+    const auto obs = world.observe();
+    visible_ = static_cast<uint32_t>(obs.size());
+    vision_ok_ = true;
+    if (vision_down) { vision_ok_ = false; return; }   // 模拟相机掉线
+    tracker.update(obs, t);
+  }
+
+  /// 与 task_executor_node 的 pick_target 一致：只在需要目标的状态挑
+  void pick()
+  {
+    const hw_task::TaskState st = seq.state();
+    const bool need = (st == hw_task::TaskState::Scan) ||
+                      (st == hw_task::TaskState::Approach) ||
+                      (st == hw_task::TaskState::Align);
+    if (!need || !vision_ok_) { return; }
+
+    const auto excluded = seq.excluded_ids();
+    const hw_task::BlockTrack best =
+      tracker.pick(cfg, Eigen::Vector2d(0.0, 0.0), excluded);
+    if (!best.stable) { return; }
+
+    have_bound_ = true;
+    bound_x = best.pos.x();
+    bound_y = best.pos.y();
+    bound_yaw = best.yaw;
+    bound_color = best.color;
+    bound_conf = static_cast<float>(best.confidence);
+    seq.bind_target(best.id, best.pos.x(), best.pos.y(), best.color, best.yaw,
+                    static_cast<float>(best.confidence));
+  }
+
+  /// 推进一个控制周期，返回本周期状态机给出的动作
+  hw_task::Actuation tick(double & t)
+  {
+    world.advance_time(dt);
+    feed_vision(t);
+    pick();
+
+    const hw_task::SensorSnapshot s = snapshot(t);
+    const hw_task::Actuation a = seq.update(s, dt);
+
+    sim.command(a);
+    world.apply(a);
+    sim.step(dt);
+    world.step(dt, s.tool_x, s.tool_y, s.tool_z);
+
+    t += dt;
+    return a;
+  }
+
+  RunResult run(const hw_task::StartRequest & req, int max_steps = 6000)
+  {
+    double t = 0.0;
+    seq.start(req, snapshot(t));
+
+    RunResult r;
+    for (int i = 0; i < max_steps; ++i) {
+      const hw_task::Actuation a = tick(t);
+      ++r.steps;
+      r.max_layer = std::max<uint8_t>(r.max_layer, seq.status().place_layer);
+      r.last_message = seq.status().message;
+      if (a.finished || a.aborted) {
+        r.finished = a.finished;
+        r.aborted = a.aborted;
+        break;
+      }
+    }
+    r.final_state = seq.state();
+    r.placed = seq.status().grasped_count;
+    r.skipped = seq.status().skipped_count;
+    r.final_t = t;
+    return r;
+  }
+
+  void add_block(double x, double y, hw_task::BlockColor c, double yaw = 0.0)
+  {
+    FakeBlock b;
+    b.x = x; b.y = y; b.color = c; b.yaw = yaw;
+    world.blocks.push_back(b);
+  }
+
+private:
+  bool     vision_ok_{true};
+  uint32_t visible_{0};
+  bool     have_bound_{false};
+  double   bound_x{0.0}, bound_y{0.0}, bound_yaw{0.0};
+  hw_task::BlockColor bound_color{hw_task::BlockColor::Red};
+  float    bound_conf{0.0f};
+};
+
+const char * st_name(hw_task::TaskState s) { return hw_task::to_string(s); }
+
+// ===========================================================================
+//  A. 工作台投影
+// ===========================================================================
+void test_projection()
+{
+  section("A. 工作台投影（像素 -> 基座系台面坐标）");
+
+  hw_task::TableProjection tp;
+  tp.set_intrinsics(make_intrinsics());
+  const Eigen::Matrix4d T = camera_to_base();
+
+  double worst = 0.0;
+  int valid = 0;
+  for (double x = -0.30; x <= 0.30; x += 0.05) {
+    for (double y = 0.20; y <= 0.80; y += 0.05) {
+      double u = 0.0, v = 0.0;
+      world_to_pixel(x, y, &u, &v);
+      const hw_task::TablePoint p = tp.project(u, v, T);
+      if (!p.valid) { continue; }
+      ++valid;
+      worst = std::max(worst, std::hypot(p.x - x, p.y - y));
+    }
+  }
+  check(valid > 100, "工作区采样点全部可投影（" + std::to_string(valid) + " 个）");
+
+  /* 外参必须是**合法旋转**（行列式 +1）。
+   * 手算而不是调 Eigen 的 determinant：主机侧用的是极简垫片，没有那个成员；
+   * 而这条断言恰恰是"相机俯视时图像 y 轴必须反向"的直接体现，值得写清楚。 */
+  const double det_rc =
+      T(0, 0) * (T(1, 1) * T(2, 2) - T(1, 2) * T(2, 1))
+    - T(0, 1) * (T(1, 0) * T(2, 2) - T(1, 2) * T(2, 0))
+    + T(0, 2) * (T(1, 0) * T(2, 1) - T(1, 1) * T(2, 0));
+  check_near(det_rc, 1.0, 1e-12,
+             "相机外参是合法旋转（行列式 +1，能被四元数表达）");
+  check(worst < 1e-9, "像素->台面 与 台面->像素 解析往返一致（最大误差 " +
+                      std::to_string(worst) + " m）");
+
+  // ---- 标定：点铺得够开 -> 完整 2D 仿射 ----
+  {
+    hw_task::TableProjection g;
+    g.set_intrinsics(make_intrinsics());
+    const double ox = 0.012, oy = -0.008;   // 模拟"相机重新夹装后偏了 1cm"
+
+    const double px[3][2] = {{60.0, 60.0}, {580.0, 60.0}, {320.0, 420.0}};
     double last_err = -1.0;
-    for (const auto & c : cal_px) {
-      const Eigen::Vector2d g = ideal(c[0], c[1]);
-      last_err = gp2.add_calibration_point(c[0], c[1], g.x() + ox, g.y() + oy, T);
+    for (const auto & c : px) {
+      /* 真实世界坐标用**解析**理想投影算，不能拿 g.project() 去求 ——
+       * 那上面已经叠了残差，第二次调用开始输出就是"已校正"的了，
+       * 再加一次偏移会变成 2×offset（第一版正是这么错的，表现为
+       * "标定之后误差反而翻倍"，看着像投影算法有 bug）。 */
+      const double wx = (c[0] - 320.0) / 600.0 * kCamH + ox;
+      const double wy = kCamY - (c[1] - 240.0) / 600.0 * kCamH + oy;
+      last_err = g.add_calibration_point(c[0], c[1], wx, wy, T);
     }
-    check(last_err >= 0.0, "标定点应被接受");
-    check(gp2.affine_solved(), "点铺得够开时应该解出完整的 2D 仿射");
-    check(gp2.calibration_spread() > hw_task::GroundProjection::kMinCalibSpread,
-          "标定点跨度应超过安全阀门槛");
-    check(last_err < 1e-3,
-          "残差应降到亚 mm 级（实际 " + std::to_string(last_err * 1000.0) + " mm）");
-
-    // 校正后再投一个点，应带上这个偏移
-    const auto p = gp2.project(320.0, 240.0, T);
-    check_near(p.x, ox, 2e-3, "校正后 x 应带上平移量");
-    check_near(p.y, 0.5 + oy, 2e-3, "校正后 y 应带上平移量");
+    check(g.affine_solved(), "标定点铺开时解出完整 2D 仿射");
+    check(last_err >= 0.0 && last_err < 1e-6,
+          "残差降到 1e-6 m 以下（实际 " + std::to_string(last_err) + "）");
+    const hw_task::TablePoint p = g.project(320.0, 240.0, T);
+    check_near(p.x, ox, 1e-3, "校正后带上 x 向平移量");
+    check_near(p.y, kCamY + oy, 1e-3, "校正后带上 y 向平移量");
   }
 
-  // ⑥ 标定点挤在一起时必须退化成"只解平移"，而不是硬解出一个坏矩阵
+  // ---- 标定点挤在一起 -> 必须退化成只解平移 ----
+  /* 三个点挤在 1cm 内时，完整 2D 仿射是**病态问题**：设计矩阵近似共线，
+   * 正规方程把条件数平方，双精度也压不住 —— 会解出一个线性部分乱飞、
+   * 靠平移去凑的矩阵。它在标定点附近很准，出了那个小区域完全失效，
+   * 但看起来"标定成功了"。所以必须有一道安全阀。 */
   {
-    hw_task::GroundProjection gp3;
-    gp3.set_intrinsics(K);
-
-    const double ox = 0.03, oy = 0.012;
-    // 三个像素挨得极近（地面跨度约 1cm），远小于 kMinCalibSpread
-    const double cal_px[3][2] = {{318.0, 239.0}, {322.0, 241.0}, {320.0, 240.0}};
-    for (const auto & c : cal_px) {
-      const Eigen::Vector2d g = ideal(c[0], c[1]);
-      gp3.add_calibration_point(c[0], c[1], g.x() + ox, g.y() + oy, T);
+    hw_task::TableProjection g;
+    g.set_intrinsics(make_intrinsics());
+    const double ox = 0.02, oy = 0.015;
+    const double px[3][2] = {{318.0, 239.0}, {322.0, 241.0}, {320.0, 240.0}};
+    for (const auto & c : px) {
+      const double wx = (c[0] - 320.0) / 600.0 * kCamH + ox;
+      const double wy = kCamY - (c[1] - 240.0) / 600.0 * kCamH + oy;
+      g.add_calibration_point(c[0], c[1], wx, wy, T);
     }
-
-    check(!gp3.affine_solved(), "点太集中时不应解完整仿射");
-    check(gp3.calibration_spread() < hw_task::GroundProjection::kMinCalibSpread,
-          "跨度判定应识别出点太集中");
-    // 线性部分必须仍是单位阵（只解了平移）
-    const Eigen::Matrix3d r = gp3.residual_matrix();
-    check_near(r(0, 0), 1.0, 1e-9, "退化情况下线性部分 x 应为 1");
-    check_near(r(0, 1), 0.0, 1e-9, "退化情况下交叉项应为 0");
-    check_near(r(1, 1), 1.0, 1e-9, "退化情况下线性部分 y 应为 1");
-    const auto p3 = gp3.project(320.0, 240.0, T);
-    check_near(p3.x, ox, 3e-3, "退化情况下平移仍应被校正");
-    check_near(p3.y, 0.5 + oy, 3e-3, "退化情况下平移仍应被校正");
+    check(!g.affine_solved(), "标定点太集中时不硬解完整仿射");
+    check(g.calibration_spread() < hw_task::TableProjection::kMinCalibSpread,
+          "跨度判定识别出点太集中");
+    const Eigen::Matrix3d r = g.residual_matrix();
+    check_near(r(0, 0), 1.0, 1e-9, "退化情况下线性部分保持单位阵");
+    check_near(r(0, 1), 0.0, 1e-9, "退化情况下交叉项为 0");
+    const hw_task::TablePoint p = g.project(320.0, 240.0, T);
+    check_near(p.x, ox, 3e-3, "退化情况下平移仍被校正");
   }
 }
 
 // ===========================================================================
-//  B. 多帧跟踪与排序
+//  B. 数据关联
 // ===========================================================================
-void test_block_tracker()
+void test_tracker()
 {
-  section("B. 多帧跟踪与目标排序");
+  section("B. 视觉数据关联");
 
+  hw_task::BlockTracker tk;
+  hw_task::TaskConfig cfg;
   hw_task::TrackerConfig tc;
-  tc.match_radius = 0.06;
   tc.min_stable_frames = 3;
-  tc.max_missing_frames = 2;
-  tc.track_ttl = 20.0;
+  tk.configure(tc);
 
-  hw_task::BlockTracker tr;
-  tr.configure(tc);
-
-  auto obs = [](double x, double y, hw_task::BlockColor c) {
+  auto obs = [](double x, double y, hw_task::BlockColor c, double area) {
       hw_task::BlockObservation o;
       o.pos = Eigen::Vector2d(x, y);
       o.color = c;
-      // 面积必须给：pick() 会用 min_area_px/max_area_px 过滤，
-      // 留 0 的话所有观测都会被当成"太小"而滤掉（第一版就踩了这个坑）。
-      o.area_px = 5000.0;
+      o.area_px = area;      // 面积必须给：pick() 会用它过滤
+      o.confidence_px = 0.8;
       return o;
     };
 
-  // ---- ① 连续 3 帧才算稳定 ----
   for (int i = 0; i < 3; ++i) {
-    tr.update({obs(0.5, 0.1, hw_task::BlockColor::Red)}, i * 0.033);
-    if (i < 2) {
-      check(tr.stable_tracks().empty(),
-            "第 " + std::to_string(i + 1) + " 帧不应判为稳定");
-    }
+    tk.update({obs(0.25, 0.10, hw_task::BlockColor::Red, 5000.0)}, 0.1 * i);
   }
-  check(tr.stable_tracks().size() == 1, "第 3 帧应出现 1 条稳定轨迹");
-  check_near(tr.tracks()[0].confidence, 1.0, 1e-9, "稳定后置信度应为 1");
+  check(tk.stable_tracks().size() == 1, "连续 3 帧同类观测形成一条稳定轨迹");
+  check(tk.pick(cfg, Eigen::Vector2d(0, 0), {}).stable, "默认面积下可以选出目标");
 
-  // ---- ② 位置抖动小于 match_radius 时不应新建轨迹 ----
-  tr.update({obs(0.52, 0.11, hw_task::BlockColor::Red)}, 0.1);
-  check(tr.tracks().size() == 1, "小抖动仍应是同一条轨迹");
-
-  // ---- ③ 远离超过 match_radius -> 新轨迹 ----
-  tr.update({obs(0.52, 0.11, hw_task::BlockColor::Red),
-             obs(0.90, -0.30, hw_task::BlockColor::Blue)}, 0.13);
-  check(tr.tracks().size() == 2, "出现第二个物块时应新建轨迹");
-
-  // ---- ④ 连续丢失超过 max_missing_frames -> 删除轨迹 ----
-  for (int i = 0; i < 4; ++i) {
-    tr.update({}, 0.16 + i * 0.033);
-  }
-  check(tr.tracks().empty(), "连续丢失后轨迹应被删除");
-
-  // ---- ⑤ 颜色优先 + 距离排序 ----
   {
-    hw_task::BlockTracker t2;
-    t2.configure(tc);
-    for (int i = 0; i < 4; ++i) {
-      t2.update({obs(0.80, 0.0, hw_task::BlockColor::Blue),
-                 obs(0.30, 0.0, hw_task::BlockColor::Red),
-                 obs(0.55, 0.0, hw_task::BlockColor::Blue)},
-                i * 0.033);
+    hw_task::BlockTracker small;
+    small.configure(tc);
+    for (int i = 0; i < 3; ++i) {
+      small.update({obs(0.25, 0.10, hw_task::BlockColor::Red, 100.0)}, 0.1 * i);
     }
-    check(t2.stable_tracks().size() == 3, "应有 3 条稳定轨迹");
-
-    const Eigen::Vector2d veh(0.0, 0.0);
-    const auto ranked = t2.rank_targets({hw_task::BlockColor::Red}, veh, 0.0, {});
-    check(ranked.size() == 3, "排序后仍应有 3 个");
-    check(ranked[0].color == hw_task::BlockColor::Red,
-          "指定红色优先时，红色必须排第一");
-    check_near(ranked[1].pos.x(), 0.55, 1e-9, "同色内应按距离升序（近的在前）");
-    check_near(ranked[2].pos.x(), 0.80, 1e-9, "同色内第二近的在后");
-
-    // 不指定颜色顺序时，纯按距离
-    const auto plain = t2.rank_targets({}, veh, 0.0, {});
-    check_near(plain[0].pos.x(), 0.30, 1e-9, "不分组时最近的排第一");
-
-    // 排除列表生效
-    const auto excl = t2.rank_targets({}, veh, 0.0, {plain[0].id});
-    check(excl.size() == 2, "排除一个后应剩 2 个");
-    check_near(excl[0].pos.x(), 0.55, 1e-9, "排除后最近的变成 0.55");
+    check(!small.pick(cfg, Eigen::Vector2d(0, 0), {}).stable,
+          "面积小于 min_area_px 的观测不会被选为目标");
   }
 
-  // ---- ⑥ 可抓范围筛选 ----
   {
-    hw_task::TaskConfig cfg;
-    cfg.min_area_px = 100.0f;
-    cfg.max_area_px = 1e9f;
-    cfg.min_confidence = 0.5f;
-    cfg.grasp_radius_min = 0.18f;
-    cfg.grasp_radius_max = 0.85f;
-    cfg.grasp_bearing_max = 0.60f;
-
-    hw_task::BlockTracker t3;
-    t3.configure(tc);
-    for (int i = 0; i < 4; ++i) {
-      t3.update({obs(0.10, 0.0, hw_task::BlockColor::Red),   // 太近
-                 obs(1.50, 0.0, hw_task::BlockColor::Red),   // 太远
-                 obs(0.50, 0.50, hw_task::BlockColor::Red),  // 方位角 45° 超限
-                 obs(0.50, 0.05, hw_task::BlockColor::Red)}, // 合法
-                i * 0.033);
+    hw_task::BlockTracker far;
+    far.configure(tc);
+    for (int i = 0; i < 3; ++i) {
+      far.update({obs(0.55, 0.0, hw_task::BlockColor::Red, 5000.0)}, 0.1 * i);
     }
-    const auto pick = t3.pick(cfg, Eigen::Vector2d(0.0, 0.0), 0.0, {});
-    check(pick.stable, "应能挑出一个合法目标");
-    check_near(pick.pos.x(), 0.50, 1e-9, "被选中的应是那个合法物块");
-    check_near(pick.pos.y(), 0.05, 1e-9, "被选中的应是那个合法物块");
+    check(!far.pick(cfg, Eigen::Vector2d(0, 0), {}).stable,
+          "超出工作半径上限的物块被排除");
+
+    hw_task::BlockTracker near;
+    near.configure(tc);
+    for (int i = 0; i < 3; ++i) {
+      near.update({obs(0.04, 0.0, hw_task::BlockColor::Red, 5000.0)}, 0.1 * i);
+    }
+    check(!near.pick(cfg, Eigen::Vector2d(0, 0), {}).stable,
+          "落在基座内孔里的物块被排除");
+  }
+
+  {
+    hw_task::BlockTracker multi;
+    multi.configure(tc);
+    std::vector<hw_task::BlockObservation> frame;
+    frame.push_back(obs(0.34, 0.0, hw_task::BlockColor::Blue, 5000.0));
+    frame.push_back(obs(0.22, 0.0, hw_task::BlockColor::Red, 5000.0));
+    frame.push_back(obs(0.30, 0.0, hw_task::BlockColor::Red, 5000.0));
+    for (int i = 0; i < 3; ++i) { multi.update(frame, 0.1 * i); }
+
+    const auto ranked = multi.rank_targets({hw_task::BlockColor::Red},
+                                           Eigen::Vector2d(0, 0), {});
+    check(ranked.size() >= 2, "排序列出多个可用目标");
+    if (ranked.size() >= 2) {
+      const bool same = (ranked[0].color == hw_task::BlockColor::Red) &&
+                        (ranked[1].color == hw_task::BlockColor::Red);
+      check(same, "指定颜色优先时先排同色的目标");
+      check((ranked[0].pos - Eigen::Vector2d(0, 0)).norm() <
+            (ranked[1].pos - Eigen::Vector2d(0, 0)).norm(),
+            "同色内部按到基座的距离升序");
+    }
   }
 }
 
 // ===========================================================================
 //  C. 完整取放流程
 // ===========================================================================
-struct CycleResult
+void test_full_cycle()
 {
-  hw_task::TaskState final_state{hw_task::TaskState::Idle};
-  uint32_t placed{0};
-  uint32_t skipped{0};
-  int steps{0};
-  double end_x{0.0}, end_y{0.0}, end_yaw{0.0};
-  std::string last_message;
-};
+  section("C. 完整取放流程（1 个物块）");
 
-/// 跑一次完整任务直到进入终态
-CycleResult run_cycle(hw_task::TaskSequencer & seq, VehicleSim & veh, FakeWorld & world,
-                      const hw_task::StartRequest & req, double block_x, double block_y,
-                      double block_yaw, int max_steps = 8000)
-{
-  CycleResult r;
-
-  hw_task::SensorSnapshot s0 = make_snapshot(veh, world, false, nullptr);
-  seq.start(req, s0);
-
-  const double dt = 0.02;
-  bool started = true;
-
-  for (int i = 0; i < max_steps; ++i) {
-    // --- 视觉：把当前"还没被处理掉"的物块喂给状态机 ---
-    FakeWorld::Block * tgt = nullptr;
-    for (auto & b : world.blocks) {
-      if (!b.removed && !b.on_vehicle) { tgt = &b; break; }
-    }
-
-    const auto st = seq.state();
-    const bool need_target = (st == hw_task::TaskState::Scan) ||
-                             (st == hw_task::TaskState::Approach) ||
-                             (st == hw_task::TaskState::Align);
-
-    // 模拟 ROS 节点：处于需要目标的阶段时，持续把目标重新绑定给状态机
-    if (need_target && tgt) {
-      seq.bind_target(1, Eigen::Vector2d(tgt->x, tgt->y), tgt->color, tgt->yaw, 1.0f);
-    }
-
-    hw_task::SensorSnapshot s = make_snapshot(veh, world, tgt != nullptr, tgt);
-    const hw_task::Actuation a = seq.update(s, dt);
-
-    // --- 执行动作 ---
-    veh.step(a.cmd_vx, a.cmd_wz, dt);
-    world.pump_run = a.pump_run;
-    world.pump_duty = a.pump_duty;
-    world.pump_step(dt);
-
-    // --- 物块状态机：吸住了就跟着车走，放下了就落在车前面 ---
-    if (tgt && !tgt->on_vehicle && a.pump_run &&
-        std::fabs(world.pressure) > 10.0) {
-      // 判定吸住后由状态机自己管，这里只在"释放"时处理
-    }
-    if (tgt && !tgt->on_vehicle && world.pressure < -10.0 && a.pump_run) {
-      tgt->on_vehicle = true;
-    }
-    if (tgt && tgt->on_vehicle && !a.pump_run) {
-      tgt->on_vehicle = false;
-      tgt->removed = true;
-      // 放到车前方 standoff 处
-      tgt->x = veh.x + 0.34 * std::cos(veh.yaw);
-      tgt->y = veh.y + 0.34 * std::sin(veh.yaw);
-      tgt->yaw = veh.yaw;
-    }
-
-    r.steps = i;
-    r.last_message = seq.status().message;
-
-    if (a.finished || a.aborted) { break; }
-    if (!started) { break; }
-  }
-
-  const auto & stt = seq.status();
-  r.final_state = stt.state;
-  r.placed = stt.grasped_count;
-  r.skipped = stt.skipped_count;
-  r.end_x = veh.x;
-  r.end_y = veh.y;
-  r.end_yaw = veh.yaw;
-  return r;
-}
-
-hw_task::TaskConfig make_task_config()
-{
-  hw_task::TaskConfig cfg;
-  // 判据放宽到测试用（真车参数见 config/task.yaml）
-  cfg.min_confidence = 0.5f;
-  cfg.min_stable_frames = 1;
-  cfg.min_area_px = 100.0f;
-  cfg.max_area_px = 1e9f;
-  cfg.grasp_radius_min = 0.18f;
-  cfg.grasp_radius_max = 0.85f;
-  cfg.grasp_bearing_max = 0.70f;
-
-  cfg.approach_speed = 0.35f;
-  cfg.align_speed = 0.09f;
-  cfg.standoff = 0.34f;
-  cfg.standoff_tol = 0.030f;
-  cfg.bearing_tol = 0.045f;
-
-  cfg.scan_timeout = 2.0f;      // 测试里缩短，不然一个失败用例要跑 12 秒
-  cfg.approach_timeout = 20.0f;
-  cfg.align_timeout = 12.0f;
-  cfg.settle_time = 0.20f;
-  cfg.descend_time = 0.15f;
-  cfg.grasp_timeout = 0.8f;
-  cfg.lift_time = 0.20f;
-  cfg.haul_timeout = 60.0f;
-  cfg.place_timeout = 25.0f;
-  cfg.release_time = 0.20f;
-  cfg.retreat_time = 0.40f;
-  cfg.vision_lost_timeout = 1.0f;
-
-  cfg.max_scan_retry = 3;
-  cfg.max_align_retry = 2;
-  cfg.max_grasp_retry = 2;
-
-  cfg.use_pressure_check = true;
-  cfg.use_pump_pressure_mode = false;
-  cfg.grasp_duty = 1.0f;
-  cfg.hold_duty = 0.75f;
-  cfg.vacuum_threshold_kpa = 6.0f;
-
-  cfg.place_x = 0.0;
-  cfg.place_y = 1.20;
-  cfg.place_yaw = 1.5707963267948966;
-  cfg.place_pitch = 0.12;
-  cfg.place_columns = 4;
-  cfg.place_row_pitch = 0.12;
-
-  cfg.home_x = 0.0;
-  cfg.home_y = 0.0;
-  cfg.home_yaw = 0.0;
-  return cfg;
-}
-
-void test_nominal_cycle()
-{
-  section("C. 完整取放流程（正前方物块）");
-
-  hw_task::TaskSequencer seq;
-  seq.configure(make_task_config());
-
-  VehicleSim veh;
-  FakeWorld world;
-  world.blocks.push_back({0.55, 0.0, 0.0, hw_task::BlockColor::Red, false, false});
+  Harness h;
+  h.add_block(0.26, 0.06, hw_task::BlockColor::Red, 0.3);
 
   hw_task::StartRequest req;
   req.max_blocks = 1;
 
-  const auto r = run_cycle(seq, veh, world, req, 0.55, 0.0, 0.0);
+  const RunResult r = h.run(req);
 
-  std::printf("  终态=%s 放置=%u 跳过=%u 步数=%d 位置=(%.3f, %.3f, %.3f)\n",
-              hw_task::to_string(r.final_state), r.placed, r.skipped, r.steps,
-              r.end_x, r.end_y, r.end_yaw);
+  std::printf("  终态=%s 放置=%u 跳过=%u 步数=%d 用时=%.1fs\n",
+              st_name(r.final_state), r.placed, r.skipped, r.steps, r.final_t);
+  std::printf("  末条消息: %s\n", r.last_message.c_str());
 
-  check(r.final_state == hw_task::TaskState::Done, "任务应正常结束");
-  check(r.placed == 1, "应放置 1 个物块");
-  check(r.skipped == 0, "不应有跳过");
-
-  // 结束位置应靠近投放槽位 0：(0.0, 1.20)，朝向 π/2
-  check_near(r.end_x, 0.0, 0.12, "结束后 x 应落在投放槽位附近");
-  check_near(r.end_y, 1.20, 0.12, "结束后 y 应落在投放槽位附近");
-  check_near(r.end_yaw, 1.5707963267948966, 0.15, "结束后朝向应对上投放朝向");
+  check(r.final_state == hw_task::TaskState::Done, "任务正常结束");
+  check(r.finished, "上报 finished=true");
+  check(r.placed == 1, "放置计数为 1");
+  check(r.skipped == 0, "没有跳过任何物块");
+  check(r.max_layer == 0, "码垛模式下第一个物块放在第 0 层");
 }
 
-void test_side_block()
+// ===========================================================================
+//  D. 吸不住
+// ===========================================================================
+void test_grasp_failure()
 {
-  section("D. 侧前方物块（考验转向收敛）");
+  section("D. 吸不住（气路故障）");
 
-  hw_task::TaskSequencer seq;
-  seq.configure(make_task_config());
-
-  VehicleSim veh;
-  FakeWorld world;
-  // 方位角 atan2(0.28, 0.50) ≈ 29°，在 grasp_bearing_max 内
-  world.blocks.push_back({0.50, 0.28, 0.0, hw_task::BlockColor::Blue, false, false});
+  Harness h;
+  h.world.pump_dead = true;          // 泵抽不出真空
+  h.add_block(0.26, 0.05, hw_task::BlockColor::Blue);
 
   hw_task::StartRequest req;
   req.max_blocks = 1;
 
-  const auto r = run_cycle(seq, veh, world, req, 0.50, 0.28, 0.0);
-
-  std::printf("  终态=%s 放置=%u 跳过=%u 步数=%d 位置=(%.3f, %.3f)\n",
-              hw_task::to_string(r.final_state), r.placed, r.skipped, r.steps,
-              r.end_x, r.end_y);
-
-  check(r.final_state == hw_task::TaskState::Done, "侧前方物块也应能完成");
-  check(r.placed == 1, "应放置 1 个物块");
-}
-
-void test_grasp_failure_skips()
-{
-  section("E. 吸不住时跳过并最终失败（不卡死）");
-
-  hw_task::TaskSequencer seq;
-  auto cfg = make_task_config();
-  cfg.max_grasp_retry = 2;
-  seq.configure(cfg);
-
-  VehicleSim veh;
-  FakeWorld world;
-  world.vacuum_capable = false;      // 永远吸不住
-  world.blocks.push_back({0.55, 0.0, 0.0, hw_task::BlockColor::Red, false, false});
-
-  hw_task::StartRequest req;
-  req.max_blocks = 1;
-
-  const auto r = run_cycle(seq, veh, world, req, 0.55, 0.0, 0.0);
+  const RunResult r = h.run(req, 9000);
 
   std::printf("  终态=%s 放置=%u 跳过=%u 步数=%d\n",
-              hw_task::to_string(r.final_state), r.placed, r.skipped, r.steps);
+              st_name(r.final_state), r.placed, r.skipped, r.steps);
+  std::printf("  末条消息: %s\n", r.last_message.c_str());
 
-  // 关键：必须走到终态，不能永远卡在重试循环里
-  check(r.final_state == hw_task::TaskState::Failed,
-        "一直吸不住时应以 FAILED 结束（而不是永远重试）");
-  check(r.placed == 0, "一个都不该放置");
-  check(r.skipped > 0, "应有跳过计数");
-  check(r.steps < 7900, "不应该在重试里打转太久");
+  check(r.placed == 0, "一个都没放上");
+  check(r.skipped > 0, "吸不住的物块被计入跳过");
+  check(r.aborted || r.finished, "走到了终态而不是卡在重试循环里");
+  /* 关键回归：连续吸不住进了 FAILED，必须把 aborted 报给上层。
+   * 曾经的写法是 a.aborted = true 之后 return stop_all(...)，
+   * 而 stop_all 新建对象 —— 标志丢了，上层以为任务还在跑。 */
+  check(r.aborted, "连续吸不住时把 aborted 上报给上层");
 }
 
+// ===========================================================================
+//  E. 急停
+// ===========================================================================
 void test_estop()
 {
-  section("F. 急停中断");
+  section("E. 急停");
 
-  hw_task::TaskSequencer seq;
-  seq.configure(make_task_config());
-
-  VehicleSim veh;
-  FakeWorld world;
-  world.blocks.push_back({0.55, 0.0, 0.0, hw_task::BlockColor::Red, false, false});
+  Harness h;
+  h.add_block(0.26, 0.05, hw_task::BlockColor::Red);
 
   hw_task::StartRequest req;
   req.max_blocks = 1;
-  seq.start(req, make_snapshot(veh, world, false, nullptr));
+  double t = 0.0;
+  h.seq.start(req, h.snapshot(t));
 
-  // 推进到 ALIGN 附近，然后急停
-  bool reached_align = false;
-  for (int i = 0; i < 2000 && !reached_align; ++i) {
-    seq.bind_target(1, Eigen::Vector2d(0.55, 0.0), hw_task::BlockColor::Red, 0.0, 1.0f);
-    hw_task::SensorSnapshot s = make_snapshot(veh, world, true, &world.blocks[0]);
-    const auto a = seq.update(s, 0.02);
-    veh.step(a.cmd_vx, a.cmd_wz, 0.02);
-    world.pump_run = a.pump_run;
-    world.pump_step(0.02);
-    if (seq.state() == hw_task::TaskState::Align ||
-        seq.state() == hw_task::TaskState::Settle) {
-      reached_align = true;
-    }
-  }
-  check(reached_align, "应能推进到 ALIGN/SETTLE");
+  for (int i = 0; i < 40; ++i) { h.tick(t); }   // 0.8s，此时应在接近/对准
+  std::printf("  急停前状态=%s\n", st_name(h.seq.state()));
 
-  hw_task::SensorSnapshot s = make_snapshot(veh, world, true, &world.blocks[0]);
-  s.estop = true;
-  const auto a = seq.update(s, 0.02);
+  h.estop = true;
+  const hw_task::SensorSnapshot s = h.snapshot(t);
+  const hw_task::Actuation a = h.seq.update(s, h.dt);
 
-  check(seq.state() == hw_task::TaskState::Failed, "急停后应进入 FAILED");
-  check(!a.pump_run, "急停后气泵应停止");
-  check(a.cmd_vx == 0.0 && a.cmd_wz == 0.0, "急停后底盘指令应为零");
+  check(h.seq.state() == hw_task::TaskState::Failed, "急停后进入 FAILED");
+  check(!a.pump_run, "急停同时关掉气泵");
+  check(!a.set_pose, "急停不再下达新的运动目标");
 }
 
+// ===========================================================================
+//  F. 中止 + 回原点
+// ===========================================================================
 void test_abort_return_home()
 {
-  section("G. 中止并返回起点");
+  section("F. 中止后返回原点");
 
-  hw_task::TaskSequencer seq;
-  seq.configure(make_task_config());
-
-  VehicleSim veh;
-  FakeWorld world;
-  world.blocks.push_back({0.55, 0.0, 0.0, hw_task::BlockColor::Red, false, false});
+  Harness h;
+  h.add_block(0.26, 0.05, hw_task::BlockColor::Red);
+  h.add_block(0.34, -0.10, hw_task::BlockColor::Blue);
 
   hw_task::StartRequest req;
-  req.max_blocks = 5;
-  seq.start(req, make_snapshot(veh, world, false, nullptr));
+  req.max_blocks = 2;
+  double t = 0.0;
+  h.seq.start(req, h.snapshot(t));
 
-  for (int i = 0; i < 300; ++i) {
-    seq.bind_target(1, Eigen::Vector2d(0.55, 0.0), hw_task::BlockColor::Red, 0.0, 1.0f);
-    hw_task::SensorSnapshot s = make_snapshot(veh, world, true, &world.blocks[0]);
-    const auto a = seq.update(s, 0.02);
-    veh.step(a.cmd_vx, a.cmd_wz, 0.02);
-    world.pump_step(0.02);
-  }
-  const double moved = std::hypot(veh.x, veh.y);
-  check(moved > 0.10, "中止前应该确实移动过（否则测试没有意义）");
+  for (int i = 0; i < 40; ++i) { h.tick(t); }
+  std::printf("  中止前状态=%s\n", st_name(h.seq.state()));
 
-  seq.abort(true, true, make_snapshot(veh, world, true, &world.blocks[0]));
+  const bool ok = h.seq.abort(/*release=*/true, /*return_home=*/true, h.snapshot(t));
+  check(ok, "中止调用被接受");
 
-  // 跑到终态
-  bool done = false;
-  for (int i = 0; i < 3000 && !done; ++i) {
-    hw_task::SensorSnapshot s = make_snapshot(veh, world, true, &world.blocks[0]);
-    const auto a = seq.update(s, 0.02);
-    veh.step(a.cmd_vx, a.cmd_wz, 0.02);
-    world.pump_step(0.02);
-    if (a.aborted || seq.state() == hw_task::TaskState::Failed) { done = true; }
+  hw_task::Actuation a;
+  bool aborted_reported = false;
+  for (int i = 0; i < 2000; ++i) {
+    a = h.tick(t);
+    if (a.aborted) { aborted_reported = true; break; }
   }
 
-  std::printf("  终态=%s 回到 (%.3f, %.3f)\n",
-              hw_task::to_string(seq.state()), veh.x, veh.y);
-
-  check(seq.state() == hw_task::TaskState::Failed, "中止后应进入 FAILED");
-  // 关键：中止+回起点之后**不能**继续扫描找物块（这是修过的一个 bug）
-  check_near(veh.x, 0.0, 0.15, "应回到起点 x");
-  check_near(veh.y, 0.0, 0.15, "应回到起点 y");
+  std::printf("  中止后状态=%s 消息=%s\n", st_name(h.seq.state()), a.note.c_str());
+  check(h.seq.state() == hw_task::TaskState::Failed, "中止后进入 FAILED（不继续干活）");
+  check(aborted_reported, "中止把 aborted 上报给上层");
+  /* 最关键的一条：中止后不能自己继续下一个物块。
+   * 曾经的实现借用 RETREAT 状态回原点，而 RETREAT 的职责是"退开后找下一个" ——
+   * 结果按了中止，机械臂回到原点又接着抓。 */
+  check(h.seq.status().grasped_count == 0, "中止后没有偷偷继续放物块");
 }
 
+// ===========================================================================
+//  G. 搬运途中掉件
+// ===========================================================================
 void test_payload_drop()
 {
-  section("H. 搬运途中掉件");
+  section("G. 搬运途中掉件");
 
-  /* 这个用例要模拟的是"吸住了 -> 运到半路掉了"，不是"从头就吸不住"
-   * （后者是 C 用例的吸不住场景）。所以先用正常的假世界跑到 HAUL，
-   * 再从那一刻起把 drop_after_grasp 打开，压力随即跌回大气压。 */
-  hw_task::TaskSequencer seq;
-  seq.configure(make_task_config());
-
-  VehicleSim veh;
-  FakeWorld world;
-  world.blocks.push_back({0.55, 0.0, 0.0, hw_task::BlockColor::Red, false, false});
+  Harness h;
+  h.add_block(0.26, 0.05, hw_task::BlockColor::Red);
 
   hw_task::StartRequest req;
   req.max_blocks = 1;
-  seq.start(req, make_snapshot(veh, world, false, nullptr));
+  double t = 0.0;
+  h.seq.start(req, h.snapshot(t));
 
-  const double dt = 0.02;
   bool saw_haul = false;
-  bool saw_drop_reaction = false;
-  hw_task::TaskState final_state = hw_task::TaskState::Idle;
+  bool saw_skip = false;
+  hw_task::Actuation a;
+  for (int i = 0; i < 9000; ++i) {
+    a = h.tick(t);
 
-  for (int i = 0; i < 8000; ++i) {
-    FakeWorld::Block * tgt = nullptr;
-    for (auto & b : world.blocks) {
-      if (!b.removed && !b.on_vehicle) { tgt = &b; break; }
-    }
-    const auto st = seq.state();
-    const bool need = (st == hw_task::TaskState::Scan) ||
-                      (st == hw_task::TaskState::Approach) ||
-                      (st == hw_task::TaskState::Align);
-    if (need && tgt) {
-      seq.bind_target(1, Eigen::Vector2d(tgt->x, tgt->y), tgt->color, tgt->yaw, 1.0f);
-    }
-
-    hw_task::SensorSnapshot s = make_snapshot(veh, world, tgt != nullptr, tgt);
-    const auto a = seq.update(s, dt);
-
-    veh.step(a.cmd_vx, a.cmd_wz, dt);
-    world.pump_run = a.pump_run;
-    world.pump_duty = a.pump_duty;
-
-    // 一旦进入 HAUL 就打开"掉件"，模拟吸盘在颠簸中泄压
-    if (seq.state() == hw_task::TaskState::Haul && !saw_haul) {
+    /* 一旦进入 HAUL 就把吸盘"弄漏气"。注意必须等到 HAUL 之后 ——
+     * 从头就漏气测的是"吸不住"（D 用例），不是"搬着搬着掉了"。 */
+    if (h.seq.state() == hw_task::TaskState::Haul && !saw_haul) {
       saw_haul = true;
-      world.drop_after_grasp = true;
+      h.world.drops_on_lift = true;
+      h.world.drop_trigger_z = 0.070;
     }
-    world.pump_step(dt);
+    if (h.seq.status().skipped_count > 0) { saw_skip = true; }
 
-    if (tgt && !tgt->on_vehicle && world.pressure < -10.0 && a.pump_run) {
-      tgt->on_vehicle = true;
-    }
-
-    if (saw_haul && seq.status().skipped_count > 0) {
-      saw_drop_reaction = true;
-    }
-    if (a.finished || a.aborted) { final_state = seq.state(); break; }
-    final_state = seq.state();
+    if (a.finished || a.aborted) { break; }
   }
 
-  std::printf("  终态=%s 放置=%u 跳过=%u 进入过HAUL=%s\n",
-              hw_task::to_string(final_state), seq.status().grasped_count,
-              seq.status().skipped_count, saw_haul ? "是" : "否");
+  std::printf("  进入过HAUL=%s 触发跳过=%s 终态=%s 放置=%u\n",
+              saw_haul ? "是" : "否", saw_skip ? "是" : "否",
+              st_name(h.seq.state()), h.seq.status().grasped_count);
 
-  check(saw_haul, "应该先成功吸住并进入搬运阶段（否则这个用例没测到东西）");
-  check(saw_drop_reaction, "掉件后应触发跳过处理");
-  check(seq.status().grasped_count == 0, "掉件了就不该计入放置成功");
-  check(final_state != hw_task::TaskState::Idle, "应走到终态而不是卡住");
+  check(saw_haul, "先成功吸住并进入搬运阶段（否则这个用例什么也没测到）");
+  check(saw_skip, "掉件后触发了跳过处理");
+  check(h.seq.status().grasped_count == 0, "掉件了就不该计入放置成功");
+  check(h.seq.state() != hw_task::TaskState::Idle, "走到了终态而不是卡住");
 }
 
+// ===========================================================================
+//  H. 暂停 / 恢复
+// ===========================================================================
 void test_pause_resume()
 {
-  section("I. 暂停与恢复（计时补偿）");
+  section("H. 暂停与恢复");
 
-  hw_task::TaskSequencer seq;
-  seq.configure(make_task_config());
-
-  VehicleSim veh;
-  FakeWorld world;
-  world.blocks.push_back({0.55, 0.0, 0.0, hw_task::BlockColor::Red, false, false});
+  Harness h;
+  h.add_block(0.26, 0.05, hw_task::BlockColor::Red);
 
   hw_task::StartRequest req;
   req.max_blocks = 1;
-  seq.start(req, make_snapshot(veh, world, false, nullptr));
+  double t = 0.0;
+  h.seq.start(req, h.snapshot(t));
 
-  // 推进到 APPROACH/ALIGN。60 步 = 1.2 秒：物块在正前方 0.55m，
-  // 按 0.35 m/s 大约 1 秒走完接近段，此时正好在 APPROACH 或 ALIGN。
-  // 原来用 200 步（4 秒）会一路跑到 HAUL，测不到想测的东西。
-  for (int i = 0; i < 60; ++i) {
-    seq.bind_target(1, Eigen::Vector2d(0.55, 0.0), hw_task::BlockColor::Red, 0.0, 1.0f);
-    hw_task::SensorSnapshot s = make_snapshot(veh, world, true, &world.blocks[0]);
-    const auto a = seq.update(s, 0.02);
-    veh.step(a.cmd_vx, a.cmd_wz, 0.02);
-    world.pump_step(0.02);
+  // 推进到 APPROACH/ALIGN。60 步 = 1.2s：物块在 0.26m 处，
+  // 仿真关节限速 60% 下大约 1s 走完接近段。
+  // 原先把这一步写成 200 步（4 秒），早就跑到 HAUL 去了，测不到想测的东西。
+  for (int i = 0; i < 60; ++i) { h.tick(t); }
+  const hw_task::TaskState before = h.seq.state();
+  std::printf("  暂停前状态=%s\n", st_name(before));
+
+  check(h.seq.pause(h.snapshot(t)), "暂停被接受");
+  check(h.seq.state() == hw_task::TaskState::Paused, "进入 PAUSED");
+
+  // 暂停期间推进 2 秒（真实时间在走，状态机不该动）
+  for (int i = 0; i < 100; ++i) { t += h.dt; }
+
+  check(h.seq.resume(h.snapshot(t)), "恢复被接受");
+  check(h.seq.state() == before, "恢复到暂停前的状态");
+
+  /* 恢复后不能立刻超时 —— 这验证的是"把暂停时长从两个计时器里扣掉"。
+   * 曾经的写法先 t_state_ = s.t 再 t_task_ += (s.t - t_state_)，
+   * 括号里恒为 0，等于没补偿；暂停 2 秒再恢复会立刻触发状态超时。 */
+  h.seq.update(h.snapshot(t), h.dt);
+  check(h.seq.state() == before, "恢复后的第一个周期不会因超时跳状态");
+
+  bool done = false;
+  for (int i = 0; i < 8000; ++i) {
+    const hw_task::Actuation b = h.tick(t);
+    if (b.finished || b.aborted) { done = true; break; }
   }
+  check(done, "恢复后能继续跑完任务");
+  check(h.seq.status().grasped_count == 1, "最终放置了 1 个");
+}
 
-  const auto before = seq.state();
-  check(before == hw_task::TaskState::Approach ||
-        before == hw_task::TaskState::Align, "应处于接近/对准阶段");
+// ===========================================================================
+//  I. 不可达目标
+// ===========================================================================
+void test_unreachable_target()
+{
+  section("I. 不可达目标的处理");
 
-  check(seq.pause(make_snapshot(veh, world, true, &world.blocks[0])), "暂停应成功");
-  check(seq.state() == hw_task::TaskState::Paused, "状态应为 PAUSED");
+  Harness h;
+  h.add_block(0.55, 0.0, hw_task::BlockColor::Red);   // 超出 0.40 的工作半径上限
 
-  // 暂停期间推进 10 秒（模拟操作员去处理别的事）
-  for (int i = 0; i < 500; ++i) {
-    veh.t += 0.02;
-    hw_task::SensorSnapshot s = make_snapshot(veh, world, true, &world.blocks[0]);
-    const auto a = seq.update(s, 0.02);
-    check(a.cmd_vx == 0.0 && a.cmd_wz == 0.0, "暂停期间底盘不应动");
-    break;   // 只检查一次就够，避免刷屏
-  }
-  veh.t += 10.0;
+  hw_task::StartRequest req;
+  req.max_blocks = 1;
 
-  check(seq.resume(make_snapshot(veh, world, true, &world.blocks[0])), "恢复应成功");
-  check(seq.state() == before, "恢复后应回到原来的状态");
+  const RunResult r = h.run(req, 9000);
 
-  // 恢复后不能立刻超时。原实现里 t_state_ 被重置成当前时间之后再减去它自己，
-  // 等于没补偿，恢复的瞬间就会因为"状态已持续 10 秒"而超时。
-  hw_task::SensorSnapshot s2 = make_snapshot(veh, world, true, &world.blocks[0]);
-  const auto a2 = seq.update(s2, 0.02);
-  (void)a2;
-  check(seq.state() == before,
-        "恢复后的第一个周期不应立刻超时跳走（实际：" +
-        std::string(hw_task::to_string(seq.state())) + "）");
+  std::printf("  终态=%s 放置=%u 跳过=%u 步数=%d\n",
+              st_name(r.final_state), r.placed, r.skipped, r.steps);
+  std::printf("  末条消息: %s\n", r.last_message.c_str());
+
+  check(r.placed == 0, "够不到的物块不会被抓");
+  check(r.final_state == hw_task::TaskState::Failed ||
+        r.final_state == hw_task::TaskState::Done,
+        "最终收敛到终态（DONE 或 FAILED），不会无限重试");
+}
+
+// ===========================================================================
+//  J. 码垛
+// ===========================================================================
+void test_stacking()
+{
+  section("J. 码垛（同槽位逐层叠高）");
+
+  Harness h;
+  h.cfg.place_mode = hw_task::PlaceMode::Stack;
+  h.cfg.place_max_layers = 3;
+  h.seq.configure(h.cfg);
+
+  h.add_block(0.24, 0.05, hw_task::BlockColor::Red);
+  h.add_block(0.30, 0.02, hw_task::BlockColor::Blue);
+  h.add_block(0.27, -0.06, hw_task::BlockColor::Green);
+
+  hw_task::StartRequest req;
+  req.max_blocks = 3;
+
+  const RunResult r = h.run(req, 24000);
+
+  std::printf("  终态=%s 放置=%u 跳过=%u 最高层=%u 步数=%d\n",
+              st_name(r.final_state), r.placed, r.skipped, r.max_layer, r.steps);
+  std::printf("  末条消息: %s\n", r.last_message.c_str());
+
+  check(r.placed == 3, "三个物块都放上了");
+  check(r.final_state == hw_task::TaskState::Done, "任务正常结束");
+  /* 这是"有了升降轴才能做码垛"的直接体现：底盘方案里 Z 不可控，只能平铺。
+   * 这里要求层号确实递增过 —— 否则就是"平铺"而不是"码垛"。 */
+  check(r.max_layer >= 2, "层号递增到 2（第 3 层），确实在叠高而不是平铺");
+}
+
+// ===========================================================================
+//  K. 视觉持续丢失
+// ===========================================================================
+void test_vision_lost()
+{
+  section("K. 视觉持续丢失");
+
+  Harness h;
+  h.vision_down = true;      // 相机掉线
+  h.add_block(0.26, 0.05, hw_task::BlockColor::Red);
+
+  hw_task::StartRequest req;
+  req.max_blocks = 1;
+
+  const RunResult r = h.run(req, 6000);
+
+  std::printf("  终态=%s 步数=%d 消息=%s\n",
+              st_name(r.final_state), r.steps, r.last_message.c_str());
+
+  check(r.final_state == hw_task::TaskState::Failed, "一直看不到目标时判定失败");
+  check(r.aborted, "失败时把 aborted 上报给上层");
+  check(r.placed == 0, "没有目标就不会抓");
+}
+
+// ===========================================================================
+//  L. 视觉噪声下的鲁棒性
+// ===========================================================================
+void test_noisy_vision()
+{
+  section("L. 视觉噪声下的鲁棒性");
+
+  Harness h;
+  h.world.noise = 0.0012;    // ±1.2mm 位置噪声，接近真实投影的重复精度
+  h.add_block(0.26, 0.04, hw_task::BlockColor::Red);
+
+  hw_task::StartRequest req;
+  req.max_blocks = 1;
+
+  const RunResult r = h.run(req, 9000);
+
+  std::printf("  终态=%s 放置=%u 跳过=%u 步数=%d\n",
+              st_name(r.final_state), r.placed, r.skipped, r.steps);
+
+  /* 有 1.2mm 噪声时视觉伺服的目标每帧都在动，但 servo_tol 是 1.5mm，
+   * 所以状态机不会每周期重发目标 —— 这正是 servo_tol 存在的意义：
+   * 阈值必须比噪声大，否则收敛判据永远不满足，机械臂会在目标附近
+   * 无限微调下去（"到不了"）。 */
+  check(r.placed == 1, "有视觉噪声时仍然能完成取放");
+  check(r.final_state == hw_task::TaskState::Done, "正常结束");
 }
 
 }  // namespace
 
 int main()
 {
-  std::printf("\n\033[1mhw_task 纯逻辑层测试\033[0m\n");
-  std::printf("（假的是传感器与底盘，状态机跑的是与真车完全相同的那份代码）\n");
+  std::printf("HWB-ARM4 取放任务层 —— 主机侧回归测试\n");
+  std::printf("仿真用的是 arm_control 的真实 D-H 正逆解，闭环里没有第二套运动学\n");
 
-  test_ground_projection();
-  test_block_tracker();
-  test_nominal_cycle();
-  test_side_block();
-  test_grasp_failure_skips();
+  test_projection();
+  test_tracker();
+  test_full_cycle();
+  test_grasp_failure();
   test_estop();
   test_abort_return_home();
   test_payload_drop();
   test_pause_resume();
+  test_unreachable_target();
+  test_stacking();
+  test_vision_lost();
+  test_noisy_vision();
 
-  std::printf("\n\033[1m结果：%d 项检查，%d 项失败\033[0m\n\n", g_checks, g_failures);
-  return g_failures == 0 ? 0 : 1;
+  std::printf("\n==================================================\n");
+  std::printf("  通过 %d 项，失败 %d 项\n", g_pass, g_fail);
+  std::printf("==================================================\n");
+  return g_fail == 0 ? 0 : 1;
 }

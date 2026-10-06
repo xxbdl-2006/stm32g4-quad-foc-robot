@@ -168,61 +168,125 @@ python3 tools/motor_tune.py --motor 0
 
 - **装上实际负载后必须重做** —— 空载辨识出的 τ 只有 40 ms，
   装上负载可能是 150 ms，Kp 要相应降低。
-- 如果车在低速时"一顿一顿"，是速度环积分器在低速量化噪声下爬行。
+- 如果关节在低速时"一顿一顿"，是速度环积分器在低速量化噪声下爬行。
   把 `encoder_zero_speed_hint` 的阈值从 0.4 提到 0.8 rad/s。
 - 别追求"最优"。IMC 的理论值在实物上通常偏激进，
-  乘 0.7 是四台车实测下来比较稳的系数。
+  乘 0.7 是四个关节实测下来比较稳的系数。
 
 ---
 
-## 5. 底盘标定
+## 5. 机械臂标定
 
-### 5.1 电机转向
+前四节整定的是"单个关节的伺服好坏"，这一节校的是"整条手臂的几何对不对"。
+几何错一点，逆解就会把误差原样搬到末端 —— 伺服整得再好也没用。
 
-顶起车，单独给每个轮子 +1 rad/s，看实际转向：
+### 5.1 关节零位与方向
+
+每个关节单独小速度点动，确认转向与零位。**一次只动一个** —— 四个关节一起动
+的时候出了错分不清是哪个，末端还可能甩到料框上。
 
 ```bash
-for i in 0 1 2 3; do
-  ros2 topic pub --once /hw/motor_commands hw_msgs/msg/MotorCommandArray \
-    "{commands: [{motor_id: $i, mode: 2, setpoint: 1.0, current_limit: 1.0, enable: true}]}"
-  sleep 1
+# 走 ros2_control 路径，用关节组速度控制器（点动接口没有加速度限制，
+# 务必用小速度；ros2_control.launch.py 已激活）
+ros2 topic pub --once /arm_joint_group_velocity_controller/commands \
+  std_msgs/msg/Float64MultiArray "{data: [0.2, 0, 0, 0]}"
+ros2 topic pub --once /arm_joint_group_velocity_controller/commands \
+  std_msgs/msg/Float64MultiArray "{data: [0, 0, 0, 0]}"
+
+# 看四个关节的实测位置
+ros2 topic echo /joint_states --once
+```
+
+判据与处置：
+
+| 现象 | 处置 |
+|---|---|
+| 关节转向与预期相反 | 重新做电角度零点标定（第 2 节），或检查编码器计数方向。**不要**在指令侧加负号绕过 —— 正逆解、URDF、关节限位全都建立在"角度增大 = 逆时针"的约定上，指令侧翻一次号等于全局都错了 |
+| 零位漂移 | 机械零位是装配时打表定的，漂了说明联轴器松了，先紧机械再谈标定 |
+
+**J4 的专项核对：丝杠导程**。让 J4 走一段已知位移，量实际值：
+
+```bash
+# 指令 J4 下降 50mm（关节组位置目标，单位米）
+ros2 topic pub --once /arm_joint_trajectory_controller/joint_trajectory \
+  trajectory_msgs/msg/JointTrajectory "{joint_names: [joint_4], points: [{positions: [-0.050], time_from_start: {sec: 2}}]}"
+```
+
+用直尺量末端实际位移。50mm 指令应该得到 50mm ± 0.5mm；如果得到
+48mm，说明导程实际是 0.0096 而不是 0.010 —— 改 `arm_model.hpp` 的
+`lead`（那是唯一真源），再同步 `hardware.yaml`。导程差 2% 看着不大，
+累积到 135mm 行程就是 2.7mm，直接吃掉 `touch_z` 的过盈量。
+
+### 5.2 工作空间与正逆解校核
+
+沿几条半径走末端，记录指令位置与实测位置的偏差：
+
+```bash
+# 让末端沿 +x 轴走几个点（先使能！）
+for x in 0.15 0.20 0.25 0.30 0.35; do
+  ros2 topic pub --once /arm/target_pose hw_msgs/msg/ArmTarget \
+    "{target_pose: {position: {x: $x, y: 0.0, z: 0.10}}, speed_scale: 0.5}"
+  sleep 2
+  ros2 topic echo /arm/tool_pose --once | grep -A3 position
 done
 ```
 
-若某个轮子与"前进时该轮应转的方向"相反，把
-`hw_bringup/config/hardware.yaml` 里 `invert_motor_direction` 对应位置改成 `-1`。
+判据：
+- `x` 方向偏差 < 1mm（同一方向上 D-H 表错的体现是**恒定偏差**）；
+- `/arm/status` 的 `ik_fail_count` 全程为 0；
+- 换一个方向（比如 y = 0.20）再走一遍。**不同方向偏差不同** 说明某个连杆
+  长度错了（a1 或 a2 差 1mm，末端误差会随姿态在 0~2mm 之间变化），
+  回去改 D-H 表，不要在视觉标定里"补偿"它 —— 那只在一个姿态下有效。
 
-### 5.2 轮半径
+### 5.3 手眼标定（**最重要的一步**）
 
-推车走 5 m（地上量好），看 `/odom` 的 x：
+相机外参来自 URDF（`camera_joint` 的位置与 `camera_optical_joint` 的
+rpy=(π,0,0)），所以先核对 URDF 与实物安装：
+
+- 相机光轴是否正对工作台中心（装歪了先掰正，比改 URDF 里硬补一个角度好）；
+- `camera_optical_joint` 的 rpy **必须是 (π,0,0)**。俯视相机若把 y 轴写成
+  与基座同向，外参就成了镜像（行列式 −1），投影会静默地左右反 ——
+  症状是抓取点总在物块的镜像位置。
+
+残差校正用 `/task/calibrate_mapping` 采点：把一个物块摆在已知台面坐标
+（用直尺从基座中心量），点它的像素坐标：
 
 ```bash
-ros2 topic echo /odom --field pose.pose.position.x
+ros2 service call /task/calibrate_mapping hw_msgs/srv/CalibrateMapping \
+  "{block_color: 1, pixel_x: 318.0, pixel_y: 356.0, world_x: 0.05, world_y: 0.35}"
 ```
 
-校正：`wheel_radius_new = wheel_radius_old × (5.0 / 实测值)`
+**标定块必须铺开**：单点只解平移；要解出完整的 2D 仿射至少要 3 个不共线的
+点，且跨度要超过 8cm（`TableProjection::kMinCalibSpread`）。低于这个跨度
+时代码会**拒绝**解完整仿射、只校正平移，并在返回 message 里说明 ——
+这是刻意的安全阀：点挤在一起时解出的仿射矩阵在标定点附近很准、离开那个
+小区域完全失效，但它看起来"标定成功了"。
 
-### 5.3 等效轮距（滑移转向特有，**最重要的一步**）
+建议采点位置：工作台四个角 + 中心，共 5 点。
 
-滑移转向的车，左右轮在转向时存在侧向滑移，真实转弯半径比几何计算的大。
-表现为：**让车原地转 360°，里程计显示转了不止 360°。**
+### 5.4 取放精度验证
+
+把物块摆在可达环带内 4 个不同位置（近/远/左/右），每个位置完整取放 3 次：
 
 ```bash
-# 原地转 10 圈，看 odom 的 yaw 累计
-ros2 topic pub --rate 20 /hw/motor_commands ...   # wz = 1.0 rad/s，持续 63 秒
+ros2 service call /task/start hw_msgs/srv/StartTask \
+  "{max_blocks: 1, require_stable: true}"
 ```
 
-校正：`multiplier_new = multiplier_old × (2π / 实测 yaw)`
+判据：
+- 12 次里成功 ≥ 11 次（失败的那次要看 `/task_status` 的 message 是哪个环节）；
+- 放置位置偏差 < 5mm（用直尺量物块中心到槽位中心的距离）；
+- 抓取点在物块中心 ± 4mm 内（看吸盘压痕）。
 
-本车实测值 **1.18**，写在 `controllers.yaml` 的
-`wheel_separation_multiplier`。地面材质不同（地毯 vs 瓷砖）会差 ±10%，
-值得按使用场地重标一次。
+### 5.5 码垛层高
 
-### 5.4 直线跑偏
+叠 4 层，量顶层物块相对底层的横向偏移：
 
-如果 `invert_motor_direction` 都正确，但直行会偏：
-- 检查四轮直径是否一致（用卷尺量，差 0.5mm 就会偏）
-- 检查 `motor_control` 里四个 `current_budget_per_wheel` 是否一致
+| 现象 | 处置 |
+|---|---|
+| 每层等量平移 | `place.layer_height` 与实际物块高度不符（必须填**实测值**，不是标称值） |
+| 越往上越歪 | 丝杠背隙（反向间隙）。升降轴全程只往下压这一个方向用，正常不该出现；出现了检查丝杠预紧 |
+| 第 3 层起吸不住 | `touch_z` 的过盈量被层高累积误差吃掉了，把过盈从 2mm 加到 3mm |
 
 ---
 
@@ -304,8 +368,10 @@ ros2 topic echo /diagnostics --field status[0].values
 | 速度环 Kp / Ki（空载） | | | |
 | 速度环 Kp / Ki（满载） | | | |
 | 速度环 τ（满载） | | | |
-| 轮半径 | | | |
-| 等效轮距倍数 | | | |
+| joint_1..4 关节零位 | | | 装配打表值，联轴器重装过就要重记 |
+| 丝杠导程实测 | | | m/rev，标称 0.010 |
+| 手眼标定残差 | | | m，/task/calibrate_mapping 的返回值 |
+| 码垛层高实测 | | | m，实测物块高度 |
 | 泵压力环 Kp / Ki | | | |
 | 相机曝光延迟 | | | ms |
 

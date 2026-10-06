@@ -1,4 +1,4 @@
-// 垫片：ground_projection.hpp 里 #include <Eigen/Geometry>，
+// 垫片：table_projection.hpp 里 #include <Eigen/Geometry>，
 // 但纯逻辑层实际只用到了 Core 里的向量/矩阵，Geometry 下的
 // Quaternion/AngleAxisd 只有 ROS 节点（task_executor_node.cpp）用，
 // 而那个文件不参与主机侧测试。所以这里留空。

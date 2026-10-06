@@ -1,7 +1,7 @@
 // ============================================================================
-//  ground_projection.cpp
+//  table_projection.cpp
 // ============================================================================
-#include "hw_task/ground_projection.hpp"
+#include "hw_task/table_projection.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -64,12 +64,12 @@ Eigen::Vector3d solve3(double m[3][3], const double rhs[3])
 }
 }  // namespace
 
-void GroundProjection::set_intrinsics(const CameraIntrinsics & k)
+void TableProjection::set_intrinsics(const CameraIntrinsics & k)
 {
   K_ = k;
 }
 
-void GroundProjection::set_residual(double a00, double a01, double a10, double a11,
+void TableProjection::set_residual(double a00, double a01, double a10, double a11,
                                     double tx, double ty)
 {
   resid_ << a00, a01, tx,
@@ -78,7 +78,7 @@ void GroundProjection::set_residual(double a00, double a01, double a10, double a
   has_residual_ = true;
 }
 
-void GroundProjection::clear_residual()
+void TableProjection::clear_residual()
 {
   resid_ = Eigen::Matrix3d::Identity();
   has_residual_ = false;
@@ -87,28 +87,28 @@ void GroundProjection::clear_residual()
   affine_solved_ = false;
 }
 
-Eigen::Matrix3d GroundProjection::residual_matrix() const
+Eigen::Matrix3d TableProjection::residual_matrix() const
 {
   return resid_;
 }
 
-GroundPoint GroundProjection::apply_residual(const GroundPoint & p) const
+TablePoint TableProjection::apply_residual(const TablePoint & p) const
 {
   if (!has_residual_ || !p.valid) {
     return p;
   }
   const Eigen::Vector3d v = resid_ * Eigen::Vector3d(p.x, p.y, 1.0);
-  GroundPoint out = p;
+  TablePoint out = p;
   out.x = v.x();
   out.y = v.y();
   // range 保持原语义（相机原点到交点的距离），残差校正只动 x/y，不动它
   return out;
 }
 
-GroundPoint GroundProjection::project(double u, double v,
+TablePoint TableProjection::project(double u, double v,
                                       const Eigen::Matrix4d & T_oc) const
 {
-  GroundPoint out;
+  TablePoint out;
   if (!K_.valid()) {
     return out;
   }
@@ -134,25 +134,25 @@ GroundPoint GroundProjection::project(double u, double v,
   const Eigen::Vector3d d_cam(xd, yd, 1.0);
   const Eigen::Vector3d d_cam_n = d_cam.normalized();
 
-  // ---- 3. 旋转到 odom 系 ----
+  // ---- 3. 旋转到基座系 ----
   const Eigen::Matrix3d R_oc = T_oc.block<3, 3>(0, 0);
   const Eigen::Vector3d origin(T_oc(0, 3), T_oc(1, 3), T_oc(2, 3));
-  const Eigen::Vector3d d_odom = R_oc * d_cam_n;
+  const Eigen::Vector3d d_base = R_oc * d_cam_n;
 
   // ---- 4. 与地面 z = 0 求交 ----
-  // 相机是向下俯视的，所以 d_odom.z() 应为负；若为正说明射线朝天，
+  // 相机是向下俯视的，所以 d_base.z() 应为负；若为正说明射线朝天，
   // 那这个像素根本不在工作面上（比如拍到了远处的墙），直接判无效。
-  if (d_odom.z() > -1e-6) {
+  if (d_base.z() > -1e-6) {
     return out;
   }
-  const double t = -origin.z() / d_odom.z();
+  const double t = -origin.z() / d_base.z();
   if (t <= 0.0) {
     return out;   // 交点在相机背后
   }
 
-  const Eigen::Vector3d hit = origin + t * d_odom;
+  const Eigen::Vector3d hit = origin + t * d_base;
 
-  GroundPoint raw;
+  TablePoint raw;
   raw.x = hit.x();
   raw.y = hit.y();
   raw.range = (hit - origin).norm();
@@ -163,7 +163,7 @@ GroundPoint GroundProjection::project(double u, double v,
   return out;
 }
 
-double GroundProjection::project_yaw(double u, double v, double yaw_img_rad,
+double TableProjection::project_yaw(double u, double v, double yaw_img_rad,
                                      double length_px,
                                      const Eigen::Matrix4d & T_oc) const
 {
@@ -173,8 +173,8 @@ double GroundProjection::project_yaw(double u, double v, double yaw_img_rad,
   const double du = std::cos(yaw_img_rad) * half;
   const double dv = std::sin(yaw_img_rad) * half;
 
-  const GroundPoint p1 = project(u - du, v - dv, T_oc);
-  const GroundPoint p2 = project(u + du, v + dv, T_oc);
+  const TablePoint p1 = project(u - du, v - dv, T_oc);
+  const TablePoint p2 = project(u + du, v + dv, T_oc);
   if (!p1.valid || !p2.valid) {
     // 端点投不出来（贴太近或在视野边缘）时退回"图像角 + 相机安装偏航"的近似。
     // 这个近似只在前向俯视且物块离主点不远时成立，所以只在退化路径上用。
@@ -188,11 +188,11 @@ double GroundProjection::project_yaw(double u, double v, double yaw_img_rad,
   if (std::hypot(dx, dy) < 1e-4) {
     return 0.0;
   }
-  // 返回物块长轴与 odom 系 x 轴的夹角
+  // 返回物块长轴与 基座系 系 x 轴的夹角
   return std::atan2(dy, dx);
 }
 
-double GroundProjection::add_calibration_point(double u, double v,
+double TableProjection::add_calibration_point(double u, double v,
                                                double world_x, double world_y,
                                                const Eigen::Matrix4d & T_oc)
 {
@@ -200,7 +200,7 @@ double GroundProjection::add_calibration_point(double u, double v,
   const bool saved = has_residual_;
   const Eigen::Matrix3d saved_m = resid_;
   has_residual_ = false;
-  const GroundPoint raw = project(u, v, T_oc);
+  const TablePoint raw = project(u, v, T_oc);
   has_residual_ = saved;
   resid_ = saved_m;
 
@@ -224,11 +224,11 @@ double GroundProjection::add_calibration_point(double u, double v,
   solve_residual();
 
   // 返回校正后的重投影误差
-  const GroundPoint after = apply_residual(raw);
+  const TablePoint after = apply_residual(raw);
   return static_cast<double>(std::hypot(after.x - world_x, after.y - world_y));
 }
 
-void GroundProjection::solve_residual()
+void TableProjection::solve_residual()
 {
   if (calib_pts_ == 0) {
     clear_residual();
@@ -301,24 +301,6 @@ void GroundProjection::solve_residual()
 
   affine_solved_ = true;
   set_residual(cx(0), cx(1), cy(0), cy(1), cx(2), cy(2));
-}
-
-// ---------------------------------------------------------------------------
-PolarTarget to_polar(double tx, double ty, double vx, double vy, double vyaw)
-{
-  PolarTarget p;
-  const double dx_w = tx - vx;
-  const double dy_w = ty - vy;
-
-  p.range = std::hypot(dx_w, dy_w);
-
-  // 世界系 -> 车体系：绕 -yaw 旋转
-  const double c = std::cos(vyaw);
-  const double s = std::sin(vyaw);
-  p.dx = dx_w * c + dy_w * s;      // 车前方为正
-  p.dy = -dx_w * s + dy_w * c;     // 车左侧为正
-  p.bearing = std::atan2(p.dy, p.dx);
-  return p;
 }
 
 }  // namespace hw_task

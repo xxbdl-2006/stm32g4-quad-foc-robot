@@ -16,14 +16,13 @@ sudo apt install ros-humble-desktop ros-dev-tools
 
 # ---- 本项目额外依赖 ----
 sudo apt install \
-    ros-humble-diff-drive-controller \
     ros-humble-joint-state-broadcaster \
     ros-humble-velocity-controllers \
     ros-humble-joint-trajectory-controller \
+    ros-humble-rqt-joint-trajectory-controller \
     ros-humble-robot-state-publisher \
     ros-humble-xacro \
     ros-humble-controller-manager \
-    ros-humble-teleop-twist-keyboard \
     can-utils                           # candump / cansend / cangen
 
 # ---- 固件工具链 ----
@@ -78,7 +77,7 @@ ip -details link show can0
 
 ## 四、首次上电流程（重要）
 
-**新板子 / 换过电机后必须按顺序做这三步，否则一定会出问题。**
+**新板子 / 换过电机后必须按顺序做这四步，否则一定会出问题。**
 
 ### 步骤 1：确认能通信，但不要使能电机
 
@@ -118,36 +117,62 @@ message: 标定完成，零点已保存到驱动板 Flash
 
 四台都做完。错误的零点会让电机在低速时抖动、在高速时失控。
 
-### 步骤 3：单轴低速验证
+### 步骤 3：单关节低速点动
+
+**先点动一个关节，速度要小。** 一次只动一个，确认它的方向、零位、反馈都对得上
+再点下一个 —— 四个关节一起动的时候，出错你分不清是哪一个，还会因为末端乱甩
+撞到料框。
+
+先使能（没使能时任何目标都不会被执行）：
 
 ```bash
-# 让 M0 以 2 rad/s 转 2 秒
-ros2 topic pub --rate 50 /hw/motor_commands hw_msgs/msg/MotorCommandArray "{
-  commands: [{motor_id: 0, mode: 2, setpoint: 2.0, current_limit: 2.0, enable: true}]
-}" --times 100
+ros2 service call /arm/set_enabled std_srvs/srv/SetBool "{data: true}"
+```
+
+**走 ros2_control 路径**用关节组速度控制器点动，只给 J1 一个很小的速度：
+
+```bash
+# J1 以 0.2 rad/s 点一下（点动接口没有加速度限制，务必用小速度）
+ros2 topic pub --once /arm_joint_group_velocity_controller/commands \
+  std_msgs/msg/Float64MultiArray "{data: [0.2, 0.0, 0.0, 0.0]}"
+# 松手即归零
+ros2 topic pub --once /arm_joint_group_velocity_controller/commands \
+  std_msgs/msg/Float64MultiArray "{data: [0.0, 0.0, 0.0, 0.0]}"
+```
+
+**走直接节点路径**给一个末端目标（arm_control 自己解逆解再下发关节位置）：
+
+```bash
+ros2 topic pub --once /arm/target_pose hw_msgs/msg/ArmTarget \
+  "{target_pose: {position: {x: 0.25, y: 0.0, z: 0.10}}, speed_scale: 0.3}"
 ```
 
 同时用示波器脚本看：
+
 ```bash
 python3 tools/plot_scope.py --signals velocity,current
 ```
 
 判断标准：
-- 速度在 2 rad/s 附近，稳态误差 < 2%
+- 实际转向与指令符号一致、幅值接近（稳态误差 < 2%）
 - 电流在稳态时 < 0.5 A（空载）
 - **听**：不应该有尖锐的高频啸叫（那是电流环在振荡）
 
-四台逐一验证。
+四个关节逐一验证。**哪个关节方向反了，不要靠软件补偿** —— 回 URDF / 标定方向里
+改（见 `05_tuning.md` 第 5.1 节）。
 
-### 步骤 4：整车启动
+### 步骤 4：整机启动
 
 ```bash
 # 终端 1
 ros2 launch hw_bringup bringup.launch.py
 
-# 终端 2 —— 键盘控制
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
+# 终端 2 —— 手动点动（ros2_control 路径用 rqt 滑条拖关节角）
+ros2 run rqt_joint_trajectory_controller rqt_joint_trajectory_controller
 ```
+
+`bringup.launch.py` 默认会拉起点动工具（`use_jog:=true`），但不拉起任务层 ——
+要干活时显式加 `use_task:=true`，避免一起 launch 机械臂就自己动起来。
 
 ## 五、话题与服务清单
 
@@ -155,37 +180,56 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard
 
 | 话题 | 类型 | 方向 | 频率 |
 |---|---|---|---|
-| `/hw/motor_states` | `hw_msgs/MotorStateArray` | 发布 | 100 Hz |
+| `/arm/target_pose` | `hw_msgs/ArmTarget` | 订阅 | 事件 |
+| `/arm/tool_pose` | `geometry_msgs/PoseStamped` | 发布 | 100 Hz（末端实测位姿） |
+| `/arm/status` | `hw_msgs/ArmStatus` | 发布 | 20 Hz |
+| `/joint_states` | `sensor_msgs/JointState` | 发布 | 100 Hz（`joint_1..joint_4`，**J4 单位是米**） |
+| `/hw/motor_states` | `hw_msgs/MotorStateArray` | 发布 | 100 Hz（四轴同批次） |
+| `/hw/motor_commands` | `hw_msgs/MotorCommandArray` | 订阅 | 100 Hz |
 | `/hw/board_state` | `hw_msgs/BoardState` | 发布 | 100 Hz |
 | `/hw/pump_state` | `hw_msgs/PumpState` | 发布 | 50 Hz |
-| `/hw/camera_sync` | `hw_msgs/CameraSync` | 发布 | 触发频率 |
-| `/hw/motor_commands` | `hw_msgs/MotorCommandArray` | 订阅 | 100 Hz |
 | `/hw/pump_command` | `hw_msgs/PumpCommand` | 订阅 | 事件 |
-| `/joint_states` | `sensor_msgs/JointState` | 发布 | 100 Hz |
-| `/odom` | `nav_msgs/Odometry` | 发布 | 100 Hz |
-| `/camera/sync_joint_states` | `sensor_msgs/JointState` | 发布 | 触发频率 |
+| `/hw/camera_sync` | `hw_msgs/CameraSync` | 发布 | 触发频率 |
+| `/image_raw` | `sensor_msgs/Image` | 订阅 | 相机帧率 |
+| `/detected_blocks` | `hw_msgs/DetectedBlockArray` | 发布 | 相机帧率 |
+| `/grasp_targets` | `geometry_msgs/PoseArray` | 发布 | 事件 |
+| `/task_status` | `hw_msgs/TaskStatus` | 发布 | 20 Hz |
 | `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | 发布 | 1 Hz |
-| `/cmd_vel` | `geometry_msgs/Twist` | 订阅 | 上游决定 |
 
 ### 服务
 
 | 服务 | 类型 | 说明 |
 |---|---|---|
-| `/hw/set_motor_mode` | `SetMotorMode` | 切换单轴模式 |
-| `/hw/set_motor_gains` | `SetMotorGains` | 在线整定 PID |
-| `/hw/calibrate_motor` | `CalibrateMotor` | 电角度零点标定 |
-| `/hw/set_pump` | `SetPump` | 气泵控制 |
-| `/hw/configure_camera` | `ConfigureCamera` | 相机触发配置 |
-| `/hw/save_params` | `SaveParams` | 参数写 Flash |
+| `/arm/set_enabled` | `std_srvs/SetBool` | 使能 / 失能关节伺服（不使能不接受任何目标） |
+| `/arm/go_home` | `std_srvs/Trigger` | 回原点 |
+| `/arm/stop` | `std_srvs/Trigger` | 立即停止当前运动（保持使能） |
+| `/task/start` | `hw_msgs/StartTask` | 启动取放任务 |
+| `/task/abort` | `hw_msgs/AbortTask` | 中止任务（可选就地放下 / 保持吸住） |
+| `/task/pause` | `std_srvs/Trigger` | 暂停任务 |
+| `/task/resume` | `std_srvs/Trigger` | 继续任务 |
+| `/task/calibrate_mapping` | `hw_msgs/CalibrateMapping` | 手眼投影残差标定（采标定点） |
+| `/hw/set_motor_mode` | `hw_msgs/SetMotorMode` | 切换单轴模式 |
+| `/hw/set_motor_gains` | `hw_msgs/SetMotorGains` | 在线整定 PID |
+| `/hw/calibrate_motor` | `hw_msgs/CalibrateMotor` | 电角度零点标定 |
+| `/hw/set_pump` | `hw_msgs/SetPump` | 气泵控制 |
+| `/hw/configure_camera` | `hw_msgs/ConfigureCamera` | 相机触发配置 |
+| `/hw/save_params` | `hw_msgs/SaveParams` | 参数写 Flash |
 
 ## 六、常用操作速查
 
 ```bash
-# 急停（最高优先级，立即停所有执行器）
-ros2 topic pub --once /hw/motor_commands hw_msgs/msg/MotorCommandArray \
-  "{commands: [{motor_id: 0, mode: 0, enable: false}]}"
-# 说明：真正的急停走 CLS_ESTOP，需要直接用 cansend：
+# 急停（软件层：立即停止当前运动，保持使能，按 /arm/stop 再过一遍）
+ros2 service call /arm/stop std_srvs/srv/Trigger "{}"
+# 说明：真正的硬件急停走 CLS_ESTOP，需要直接用 cansend：
 cansend can0 070#
+
+# 手动点动 —— 直接节点路径：给一个末端目标（speed_scale 缩到 0.3 倍，慢一点）
+ros2 topic pub --once /arm/target_pose hw_msgs/msg/ArmTarget \
+  "{target_pose: {position: {x: 0.28, y: 0.0, z: 0.10}}, speed_scale: 0.3}"
+
+# 手动点动 —— ros2_control 路径：关节组速度控制器（点动务必用很小的速度 < 0.3 rad/s）
+ros2 topic pub --once /arm_joint_group_velocity_controller/commands \
+  std_msgs/msg/Float64MultiArray "{data: [0.2, 0.0, 0.0, 0.0]}"
 
 # 开气泵，40% 占空比
 ros2 service call /hw/set_pump hw_msgs/srv/SetPump \
@@ -218,12 +262,12 @@ python3 tools/motor_tune.py --motor 0
 走这条路。**注意：两条路不能同时开指令下发。**
 
 ```bash
-ros2 launch hw_bringup bringup.launch.py use_ros2_control:=true use_teleop:=false
+ros2 launch hw_bringup bringup.launch.py use_ros2_control:=true use_jog:=true
 ```
 
 这个命令会自动：
 1. 把 `can_bridge` 的 `motion_output_enabled` 设为 `false`（只做反馈）；
-2. 起 `controller_manager` + `joint_state_broadcaster` + `diff_drive_controller`；
+2. 起 `controller_manager` + `joint_state_broadcaster` + `arm_joint_trajectory_controller`；
 3. 加载 `hw_ros2_control/HwbSystem` 作为硬件接口。
 
 `hw_ros2_control` 在 `on_configure` 时会检查总线上是否已有其他节点在发
@@ -241,9 +285,13 @@ ros2 launch hw_bringup bringup.launch.py use_ros2_control:=true use_teleop:=fals
 | 电机不转但反馈正常 | 未使能 / 处于 FAULT / 电角度零点错 | `ros2 topic echo /hw/board_state --once` 看 fault 位 |
 | 电机低速抖动 + 啸叫 | 电流环 Kp 过大，或死区补偿过量 | 用 `motor_tune.py` 重新辨识；把 `current_sense_deadtime_comp` 的 base 从 8 降到 5 试 |
 | 电机高速失控 | 电角度零点标定错（尤其是编码器方向反了） | 重新标定；检查 `encoder.c` 的 `delta` 符号 |
-| 一个轮子转向反了 | 电机接线相序反 / 编码器方向反 | 改 `hardware.yaml` 的 `invert_motor_direction` 对应位 |
-| 车走直线会偏 | 滑移转向的等效轮距 ≠ 几何轮距 | 按 `05_tuning.md` 第 5 节标定 `wheel_separation_multiplier`（当前 1.18） |
-| 里程计漂移大 | 轮子打滑 / 轮半径标定不准 | 推车走 5m，量实际距离，按比例修正 `wheel_radius` |
+| 某个关节转向反了 | 编码器方向标定反 | 按 `05_tuning.md` 第 5.1 节重新做关节方向标定（不要试图在指令侧加负号绕过 —— 那会让正逆解跟着错） |
+| 末端能到位但实际差几厘米 | D-H 表长度或关节零位不对 | 用卡尺量实机，对 `arm_model.hpp`（唯一真源），再同步 URDF 与 `hardware.yaml`（见 `07_kinematics.md` 第七节） |
+| `/arm/status` 报"超出工作半径 / 超出升降行程" | 物块摆在工作环带外，或高度参数填错 | 把物块挪进 0.12~0.40 m 环带；核对 task.yaml 的 hover/touch/travel 高度 |
+| 图像能识别但抓空 | 相机外参或手眼残差 | 核对 URDF 里 camera_joint 的位置与 rpy；`/task/calibrate_mapping` 采点，看残差 |
+| 码垛越叠越偏 | 层高参数与实际物块高度不符 | 实测物块高度填 `place.layer_height`（不是标称值） |
+| 机械臂不动也不报错 | 未使能，或还没收到关节反馈 | `ros2 service call /arm/set_enabled std_srvs/srv/SetBool "{data: true}"`；看 /hw/motor_states 是否有数据 |
+| J4 升降幅度不对 | 丝杠导程参数错（URDF 里 60 倍的表现） | 确认 `arm_control` 的 `lead` 参数（0.010 m/rev），量 100mm 应对应丝杠整 10 圈 |
 | 相机图像与位姿对不上 | `exposure_delay` 估计不准 / 配对窗口太小 | 看 `/diagnostics` 的 `match_rate` 与 `exposure_delay_ms` |
 | 上位机一重启电机就停 | 这是**正确行为**（300ms 看门狗） | 无需处理 |
 | 上电后板子无反应、灯不闪 | 卡在 HardFault（多半是时钟配置） | 接 SWD，看 `board_clock_init` 的断言是否命中 |

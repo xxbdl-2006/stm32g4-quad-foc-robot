@@ -13,7 +13,9 @@ motor_tune.py —— 速度环阶跃辨识与增益建议。
     ros2 run 无关，直接 python3 tools/motor_tune.py --motor 0
     python3 tools/motor_tune.py --motor 2 --amp 3.0 --no-write
 
-前置：hw_can 的 can_bridge + motor_control 已在跑，且电机已解锁、负载已装上。
+前置：hw_can 的 can_bridge 已在跑，且目标关节已解锁、负载已装上。
+       （速度环辨识是对单关节做的，不需要起 arm_control —— 事实上
+         辨识时更希望没有别的控制律在给同一个关节发指令。）
 """
 
 import argparse

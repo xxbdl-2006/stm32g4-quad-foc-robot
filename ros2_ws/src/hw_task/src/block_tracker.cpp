@@ -2,7 +2,7 @@
 //  block_tracker.cpp
 // ============================================================================
 #include "hw_task/block_tracker.hpp"
-#include "hw_task/ground_projection.hpp"
+#include "hw_task/task_types.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -60,7 +60,7 @@ void BlockTracker::update(const std::vector<BlockObservation> & obs, double t)
       const auto & o = obs[static_cast<std::size_t>(best)];
       obs_used[static_cast<std::size_t>(best)] = true;
 
-      // 一阶低通平滑位置：投影噪声主要来自里程计和像素量化，
+      // 一阶低通平滑位置：投影噪声主要来自像素量化与标定残差，
       // 单帧跳变能到 2~3 cm，而物块是静止的，所以平滑不会引入滞后。
       const double alpha = (tr.hits == 0) ? 1.0 : 0.55;
       tr.pos = alpha * o.pos + (1.0 - alpha) * tr.pos;
@@ -149,8 +149,7 @@ std::vector<BlockTrack> BlockTracker::stable_tracks() const
 
 std::vector<BlockTrack> BlockTracker::rank_targets(
   const std::vector<BlockColor> & order,
-  const Eigen::Vector2d & vehicle,
-  double vehicle_yaw,
+  const Eigen::Vector2d & reference,
   const std::vector<uint32_t> & excluded_ids) const
 {
   std::vector<BlockTrack> cand;
@@ -177,23 +176,24 @@ std::vector<BlockTrack> BlockTracker::rank_targets(
               const int rb = color_rank(b.color);
               if (ra != rb) { return ra < rb; }
 
-              const double da = (a.pos - vehicle).norm();
-              const double db = (b.pos - vehicle).norm();
+              const double da = (a.pos - reference).norm();
+              const double db = (b.pos - reference).norm();
               if (std::abs(da - db) > 0.01) { return da < db; }
 
-              const PolarTarget pa = to_polar(a.pos.x(), a.pos.y(),
-                                              vehicle.x(), vehicle.y(), vehicle_yaw);
-              const PolarTarget pb = to_polar(b.pos.x(), b.pos.y(),
-                                              vehicle.x(), vehicle.y(), vehicle_yaw);
-              return std::abs(pa.bearing) < std::abs(pb.bearing);
+              /* 距离几乎相同时的次序：按轨迹 id。
+               * 底盘方案里这里比的是方位角（"少转弯"）；机械臂没有"车头
+               * 朝向"这个约束，各方向的运动代价只与关节行程有关，没有
+               * 便宜的平局判据。用 id 保证次序稳定即可 —— 关键是**确定性**：
+               * 排序不稳定会让同一个目标在两个周期里排出不同顺序，
+               * 状态机就会反复切换目标，永远抓不完一个。 */
+              return a.id < b.id;
             });
 
   return cand;
 }
 
 BlockTrack BlockTracker::pick(const TaskConfig & cfg,
-                              const Eigen::Vector2d & vehicle,
-                              double vehicle_yaw,
+                              const Eigen::Vector2d & reference,
                               const std::vector<uint32_t> & excluded_ids) const
 {
   BlockTrack best;
@@ -208,13 +208,15 @@ BlockTrack BlockTracker::pick(const TaskConfig & cfg,
       continue;
     }
 
-    const PolarTarget p = to_polar(tr.pos.x(), tr.pos.y(),
-                                   vehicle.x(), vehicle.y(), vehicle_yaw);
-    if (p.range < cfg.grasp_radius_min || p.range > cfg.grasp_radius_max) { continue; }
-    if (std::abs(p.bearing) > cfg.grasp_bearing_max) { continue; }
+    /* 只判"到基座回转轴的距离是否落在可达环带里"。
+     * 底盘方案里还有一条"方位角不超过 ±34°"—— 那是"车头正前方"的约束，
+     * 机械臂没有这个概念：它能转到任意方位。换成环带判据之后，落在
+     * 内孔（太近会撞基座）或外缘（接近奇异）的物块会被自然排除。 */
+    const double r = (tr.pos - reference).norm();
+    if (r < cfg.reach_radius_min || r > cfg.reach_radius_max) { continue; }
 
-    if (p.range < best_dist) {
-      best_dist = p.range;
+    if (r < best_dist) {
+      best_dist = r;
       best = tr;
       found = true;
     }

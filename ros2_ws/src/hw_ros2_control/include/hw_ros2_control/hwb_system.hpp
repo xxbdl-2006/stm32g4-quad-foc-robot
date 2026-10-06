@@ -7,7 +7,7 @@
 //  两者都直接打开 can0（Linux SocketCAN 允许多个 socket 同时订阅同一接口，
 //  每个 socket 各拿到一份帧副本）。区别在于**谁负责下发指令**：
 //
-//    · 用 can_bridge + motor_control  ：bridge 发指令，适合快速验证与自定义控制
+//    · 用 can_bridge + arm_control   ：bridge 发指令，适合逆解/轨迹规划都在自己手里的场合
 //    · 用 hw_ros2_control             ：本组件发指令，可以复用
 //                                      joint_trajectory_controller、
 //                                      velocity_controllers、joint_limits 等标准件
